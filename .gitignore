@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.vercel/
+.playwright-cli/
+.DS_Store
+*.log
+.env*
+!.env.example

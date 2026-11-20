@@ -1,0 +1,61 @@
+import express from 'express';
+import http from 'node:http';
+import path from 'node:path';
+import { WebSocket, WebSocketServer } from 'ws';
+import { createServer as createViteServer } from 'vite';
+import { createApiApp } from './server/app';
+import { getFullQuizState } from './server/db';
+import type { ServerWsMessage } from './src/types/quiz';
+
+let wss: WebSocketServer | null = null;
+
+function broadcastWs(message: ServerWsMessage): void {
+  if (!wss) return;
+  const raw = JSON.stringify(message);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(raw);
+    }
+  }
+}
+
+const app = createApiApp({ onBroadcast: broadcastWs });
+const server = http.createServer(app);
+wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+  ws.send(
+    JSON.stringify({
+      type: 'state:sync',
+      payload: getFullQuizState(),
+    } satisfies ServerWsMessage)
+  );
+});
+
+async function startServer(): Promise<void> {
+  const isProd = process.env.NODE_ENV === 'production';
+  const distDir = path.resolve(process.cwd(), 'dist');
+
+  if (isProd) {
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+  } else {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  const port = Number(process.env.PORT ?? 3000);
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`QUIZ CHAMPION LIVE server listening on http://localhost:${port}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});

@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Fredoka', system-ui, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --bg-canvas: #f4f7f7;
+    --bg-sage: #98c1bf;
+    --surface-card: #ffffff;
+    --accent-gold: #f4c424;
+    --accent-gold-deep: #e2b216;
+    --accent-coral: #ea4c2a;
+    --accent-teal: #8abbb9;
+    --accent-sand: #d9b88f;
+    --ink: #141414;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    background-color: var(--bg-canvas);
+    color: var(--ink);
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono-tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Signature tactile outline + stacked shadow inspired by playful word/quiz cards */
+.tactile-btn {
+  border: 2px solid #141414;
+  box-shadow: 0 3px 0 #141414;
+  transition: transform 0.14s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.14s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease;
+}
+
+.tactile-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 0 #141414;
+}
+
+.tactile-btn:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 #141414;
+}
+
+.tactile-card {
+  border: 2px solid #141414;
+  box-shadow: 0 4px 0 #141414;
+}
+
+@keyframes champion-pulse {
+  0%, 100% {
+    box-shadow: 0 4px 0 #141414, 0 0 0 0 rgba(244, 196, 36, 0.45);
+  }
+  50% {
+    box-shadow: 0 4px 0 #141414, 0 0 0 8px rgba(244, 196, 36, 0.18);
+  }
+}
+
+.champion-glow {
+  animation: champion-pulse 2.8s ease-in-out infinite;
+}
+
+@keyframes stage-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(6px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(4px); }
+}
+
+.animate-stage-shake {
+  animation: stage-shake 0.38s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .champion-glow,
+  .animate-stage-shake {
+    animation: none !important;
+  }
+  .tactile-btn {
+    transition: none;
+  }
+}
