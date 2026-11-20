@@ -24,13 +24,45 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
   const app = express();
 
   app.use((req, _res, next) => {
-    const reqWithFlag = req as express.Request & { _body?: boolean };
-    if (req.body !== undefined && !reqWithFlag._body) {
-      reqWithFlag._body = true;
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const reqWithFlag = req as express.Request & { _body?: boolean };
+      try {
+        if (req.body !== undefined && !reqWithFlag._body) {
+          reqWithFlag._body = true;
+        }
+      } catch {
+        // Ignore lazy getter errors on malformed pre-parsed bodies; express.json will handle or error cleanly
+      }
     }
     next();
   });
   app.use(express.json({ limit: '4mb' }));
+
+  const handleInfraError = (err: unknown, res: express.Response): boolean => {
+    const code = err instanceof Error ? err.message : '';
+    if (code === 'DATABASE_NOT_CONFIGURED') {
+      res.status(503).json({
+        error:
+          'Base de données non configurée. Ajoutez SUPABASE_URL, SUPABASE_ANON_KEY et SUPABASE_SERVICE_ROLE_KEY dans vos variables d’environnement.',
+      });
+      return true;
+    }
+    if (code === 'SUPABASE_SCHEMA_MISSING') {
+      res.status(503).json({
+        error:
+          'Les tables Supabase ne sont pas encore créées. Exécutez supabase/schema.sql dans votre SQL Editor Supabase.',
+      });
+      return true;
+    }
+    if (code === 'SUPABASE_RLS_BLOCKED') {
+      res.status(503).json({
+        error:
+          'Droits d’écriture Supabase insuffisants : ajoutez SUPABASE_SERVICE_ROLE_KEY dans vos variables serveur.',
+      });
+      return true;
+    }
+    return false;
+  };
 
   const broadcast = (message: ServerWsMessage) => {
     try {
@@ -74,9 +106,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
       process.env.SUPABASE_ANON_KEY ||
       ''
     ).trim();
+    const wsEnabled = !process.env.VERCEL;
     res.json({
       supabaseUrl: supabaseUrl || null,
       supabaseAnonKey: supabaseAnonKey || null,
+      wsEnabled,
     });
   });
 
@@ -161,18 +195,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà associé à un participant.' });
         return;
       }
-      if (code === 'SUPABASE_SCHEMA_MISSING') {
-        res.status(503).json({
-          error:
-            "Les tables Supabase ne sont pas encore créées. Exécutez supabase/schema.sql dans votre SQL Editor Supabase.",
-        });
-        return;
-      }
-      if (code === 'SUPABASE_RLS_BLOCKED') {
-        res.status(503).json({
-          error:
-            'Droits d’écriture Supabase insuffisants : ajoutez SUPABASE_SERVICE_ROLE_KEY dans vos variables serveur.',
-        });
+      if (handleInfraError(err, res)) {
         return;
       }
       console.error('[POST /api/register] unexpected error:', err);
@@ -226,18 +249,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà utilisé.' });
         return;
       }
-      if (code === 'SUPABASE_SCHEMA_MISSING') {
-        res.status(503).json({
-          error:
-            "Les tables Supabase ne sont pas encore créées. Exécutez supabase/schema.sql dans votre SQL Editor Supabase.",
-        });
-        return;
-      }
-      if (code === 'SUPABASE_RLS_BLOCKED') {
-        res.status(503).json({
-          error:
-            'Droits d’écriture Supabase insuffisants : ajoutez SUPABASE_SERVICE_ROLE_KEY dans vos variables serveur.',
-        });
+      if (handleInfraError(err, res)) {
         return;
       }
       console.error('[POST /api/admin/participants] unexpected error:', err);
@@ -324,6 +336,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(404).json({ error: 'Participant introuvable.' });
         return;
       }
+      if (handleInfraError(err, res)) {
+        return;
+      }
       console.error('[POST /api/admin/score] error:', err);
       res.status(500).json({ error: 'Erreur lors de la mise à jour du score.' });
     }
@@ -383,6 +398,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
       });
       res.json({ competition, participants });
     } catch (error) {
+      if (handleInfraError(error, res)) return;
       console.error('[PATCH /api/admin/competition] error:', error);
       res.status(500).json({ error: 'Impossible de mettre à jour la compétition.' });
     }
@@ -400,6 +416,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
       });
       res.json(fullState);
     } catch (error) {
+      if (handleInfraError(error, res)) return;
       console.error('[POST /api/admin/competition/reset] error:', error);
       res.status(500).json({ error: 'Impossible de réinitialiser la compétition.' });
     }

@@ -162,6 +162,20 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     let activeSupabaseClient = supabaseClient;
     let supabaseChannel: ReturnType<NonNullable<typeof supabaseClient>['channel']> | null = null;
 
+    const startHttpPolling = () => {
+      if (pollingTimerRef.current !== null || !mountedRef.current) return;
+      pollingTimerRef.current = window.setInterval(() => {
+        refreshState();
+      }, 2000);
+    };
+
+    const stopHttpPolling = () => {
+      if (pollingTimerRef.current !== null) {
+        window.clearInterval(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
+    };
+
     const attachSupabaseRealtime = (client: NonNullable<typeof supabaseClient>) => {
       if (!mountedRef.current || supabaseChannel) return;
       activeSupabaseClient = client;
@@ -189,31 +203,19 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
           }
         )
         .subscribe((status) => {
-          if (mountedRef.current && status === 'SUBSCRIBED') {
+          if (!mountedRef.current) return;
+          if (status === 'SUBSCRIBED') {
+            stopHttpPolling();
             setConnectionStatus('connected');
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            startHttpPolling();
           }
         });
     };
 
     if (activeSupabaseClient) {
       attachSupabaseRealtime(activeSupabaseClient);
-    } else {
-      fetch('/api/realtime-config')
-        .then((r) => (r.ok ? r.json() : null))
-        .then((cfg: { supabaseUrl?: string | null; supabaseAnonKey?: string | null } | null) => {
-          if (!mountedRef.current || !cfg?.supabaseUrl || !cfg?.supabaseAnonKey) return;
-          const client = getOrCreateSupabaseClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
-          if (client) attachSupabaseRealtime(client);
-        })
-        .catch(() => undefined);
     }
-
-    const startHttpPolling = () => {
-      if (pollingTimerRef.current !== null || !mountedRef.current) return;
-      pollingTimerRef.current = window.setInterval(() => {
-        refreshState();
-      }, 1500);
-    };
 
     const connectWs = () => {
       if (!mountedRef.current) return;
@@ -226,10 +228,7 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
         if (!mountedRef.current) return;
         wsEverConnectedRef.current = true;
         reconnectAttemptRef.current = 0;
-        if (pollingTimerRef.current !== null) {
-          window.clearInterval(pollingTimerRef.current);
-          pollingTimerRef.current = null;
-        }
+        stopHttpPolling();
         setConnectionStatus('connected');
       };
 
@@ -295,7 +294,38 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
       };
     };
 
-    connectWs();
+    fetch('/api/realtime-config')
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (
+          cfg: {
+            supabaseUrl?: string | null;
+            supabaseAnonKey?: string | null;
+            wsEnabled?: boolean;
+          } | null
+        ) => {
+          if (!mountedRef.current) return;
+          if (!supabaseChannel && cfg?.supabaseUrl && cfg?.supabaseAnonKey) {
+            const client = getOrCreateSupabaseClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
+            if (client) attachSupabaseRealtime(client);
+          }
+          if (cfg?.wsEnabled === true) {
+            connectWs();
+          } else {
+            if (!supabaseChannel) {
+              startHttpPolling();
+            }
+            setConnectionStatus('connected');
+          }
+        }
+      )
+      .catch(() => {
+        if (!mountedRef.current) return;
+        if (!supabaseChannel) {
+          startHttpPolling();
+        }
+        setConnectionStatus('connected');
+      });
 
     return () => {
       mountedRef.current = false;

@@ -263,3 +263,139 @@ test('api/index serverless handler handles pre-parsed body without 500', async (
   assert.ok(participantId);
   if (participantId) createdIds.push(participantId);
 });
+
+test('GET /api/realtime-config returns wsEnabled boolean and never exposes service role key', async () => {
+  const prevService = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnon = process.env.SUPABASE_ANON_KEY;
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevVercel = process.env.VERCEL;
+  try {
+    process.env.SUPABASE_URL = 'https://demo.supabase.co';
+    process.env.SUPABASE_ANON_KEY = 'anon-public-key';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'super-secret-service-role-key';
+    process.env.VERCEL = '1';
+
+    const res = await fetch(`${baseUrl}/api/realtime-config`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      supabaseUrl: string | null;
+      supabaseAnonKey: string | null;
+      wsEnabled: boolean;
+    };
+    assert.equal(body.supabaseUrl, 'https://demo.supabase.co');
+    assert.equal(body.supabaseAnonKey, 'anon-public-key');
+    assert.equal(body.wsEnabled, false);
+    assert.equal(JSON.stringify(body).includes('super-secret-service-role-key'), false);
+  } finally {
+    if (prevService !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevService;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnon !== undefined) process.env.SUPABASE_ANON_KEY = prevAnon;
+    else delete process.env.SUPABASE_ANON_KEY;
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevVercel !== undefined) process.env.VERCEL = prevVercel;
+    else delete process.env.VERCEL;
+  }
+});
+
+test('Vercel serverless handler returns 200 on /api/state and 503 JSON on POST /api/register when no DB is configured', async () => {
+  const { default: handler } = await import('../api/index.ts');
+
+  const envBackup = {
+    VERCEL: process.env.VERCEL,
+    SQL_HOST: process.env.SQL_HOST,
+    SUPABASE_URL: process.env.SUPABASE_URL,
+    SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY,
+    SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    VITE_SUPABASE_URL: process.env.VITE_SUPABASE_URL,
+    VITE_SUPABASE_ANON_KEY: process.env.VITE_SUPABASE_ANON_KEY,
+  };
+
+  try {
+    process.env.VERCEL = '1';
+    delete process.env.SQL_HOST;
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_ANON_KEY;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    delete process.env.VITE_SUPABASE_URL;
+    delete process.env.VITE_SUPABASE_ANON_KEY;
+
+    const invoke = async (method: string, url: string, body?: unknown) => {
+      let statusCode = 200;
+      let payload: unknown = null;
+      const headers = new Map<string, string>();
+      const listeners = new Map<string, Array<() => void>>();
+
+      const req = {
+        method,
+        url,
+        headers: body !== undefined ? { 'content-type': 'application/json' } : {},
+        ...(body !== undefined ? { body } : {}),
+      } as unknown as Parameters<typeof handler>[0];
+
+      const res = {
+        statusCode: 200,
+        headersSent: false,
+        setHeader(k: string, v: string) {
+          headers.set(k.toLowerCase(), String(v));
+          return res;
+        },
+        getHeader(k: string) {
+          return headers.get(k.toLowerCase());
+        },
+        once(evt: string, cb: () => void) {
+          const list = listeners.get(evt) ?? [];
+          list.push(cb);
+          listeners.set(evt, list);
+          return res;
+        },
+        status(code: number) {
+          statusCode = code;
+          return res;
+        },
+        json(data: unknown) {
+          payload = data;
+          res.headersSent = true;
+          for (const cb of listeners.get('finish') ?? []) cb();
+          return res;
+        },
+        end(chunk?: unknown) {
+          if (typeof chunk === 'string' && !payload) {
+            try {
+              payload = JSON.parse(chunk);
+            } catch {
+              payload = chunk;
+            }
+          }
+          res.headersSent = true;
+          for (const cb of listeners.get('finish') ?? []) cb();
+          return res;
+        },
+      } as unknown as Parameters<typeof handler>[1];
+
+      await handler(req, res);
+      return { statusCode, payload };
+    };
+
+    const cfgRes = await invoke('GET', '/api/realtime-config');
+    assert.equal(cfgRes.statusCode, 200);
+    assert.equal((cfgRes.payload as { wsEnabled?: boolean })?.wsEnabled, false);
+
+    const stateRes = await invoke('GET', '/api/state');
+    assert.equal(stateRes.statusCode, 200);
+    assert.equal((stateRes.payload as { competition?: { id?: string } })?.competition?.id, 'main');
+
+    const regRes = await invoke('POST', '/api/register', {
+      first_name: 'Alice',
+      last_name: 'Dupont',
+    });
+    assert.equal(regRes.statusCode, 503);
+    assert.match((regRes.payload as { error?: string })?.error ?? '', /Base de données non configurée/i);
+  } finally {
+    for (const [k, v] of Object.entries(envBackup)) {
+      if (v !== undefined) process.env[k] = v;
+      else delete process.env[k];
+    }
+  }
+});
+

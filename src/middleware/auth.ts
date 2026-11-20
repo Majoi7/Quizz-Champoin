@@ -1,7 +1,5 @@
 import type express from 'express';
 import type { DecodedIdToken } from 'firebase-admin/auth';
-import { adminAuth } from '../lib/firebase-admin.ts';
-import { upsertAdminUser } from '../../server/db.ts';
 import type { AdminUser } from '../types/quiz.ts';
 
 export interface AuthRequest extends express.Request {
@@ -27,7 +25,12 @@ export const requireAdmin = async (
   }
 
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
+    const [{ getAdminAuth }, { upsertAdminUser }] = await Promise.all([
+      import('../lib/firebase-admin.ts'),
+      import('../../server/db.ts'),
+    ]);
+
+    const decodedToken = await getAdminAuth().verifyIdToken(token);
     req.user = decodedToken;
 
     const email = decodedToken.email ?? `${decodedToken.uid}@firebase.local`;

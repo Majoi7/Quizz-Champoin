@@ -1,8 +1,4 @@
 import crypto from 'node:crypto';
-import { and, desc, eq, ne } from 'drizzle-orm';
-import { db } from '../src/db/index.ts';
-import { competitions, participants, scoreEvents } from '../src/db/schema.ts';
-import { getOrCreateUser } from '../src/db/users.ts';
 import { normalizeParticipantKey, rankParticipants } from '../src/lib/ranking.ts';
 import {
   applySupabaseScoreMutation,
@@ -32,13 +28,81 @@ import type {
   TieBreakerRule,
 } from '../src/types/quiz.ts';
 
-type DbCompetitionRow = typeof competitions.$inferSelect;
-type DbParticipantRow = typeof participants.$inferSelect;
-type DbScoreEventRow = typeof scoreEvents.$inferSelect;
+export const DEFAULT_COMPETITION: Competition = {
+  id: 'main',
+  name: 'QUIZ CHAMPION LIVE',
+  subtitle: 'Compétition de culture générale',
+  status: 'PREPARATION',
+  registrations_open: true,
+  require_phone: false,
+  confirm_large_delta: true,
+  large_delta_threshold: 20,
+  tie_breaker: 'EARLIEST_REACHED',
+  points_correct: 10,
+  points_wrong: -5,
+  points_bonus: 20,
+  current_round: 1,
+  round_title: 'Manche 1',
+  started_at: null,
+  elapsed_seconds: 0,
+  resumed_at: null,
+  question_timer_seconds: 30,
+  question_timer_running: false,
+  question_timer_started_at: null,
+};
 
-type DbExecutor = Pick<typeof db, 'select' | 'insert' | 'update' | 'delete'>;
+export function isCloudSqlConfigured(): boolean {
+  return Boolean((process.env.SQL_HOST || '').trim());
+}
 
-function mapCompetitionRow(row: DbCompetitionRow): Competition {
+async function getDrizzleCtx() {
+  if (!isCloudSqlConfigured()) {
+    throw new Error('DATABASE_NOT_CONFIGURED');
+  }
+  const [drizzleOrm, dbMod, schemaMod, usersMod] = await Promise.all([
+    import('drizzle-orm'),
+    import('../src/db/index.ts'),
+    import('../src/db/schema.ts'),
+    import('../src/db/users.ts'),
+  ]);
+  return {
+    and: drizzleOrm.and,
+    desc: drizzleOrm.desc,
+    eq: drizzleOrm.eq,
+    ne: drizzleOrm.ne,
+    db: dbMod.db,
+    competitions: schemaMod.competitions,
+    participants: schemaMod.participants,
+    scoreEvents: schemaMod.scoreEvents,
+    getOrCreateUser: usersMod.getOrCreateUser,
+  };
+}
+
+type DrizzleCtx = Awaited<ReturnType<typeof getDrizzleCtx>>;
+type DbExecutor = Pick<DrizzleCtx['db'], 'select' | 'insert' | 'update' | 'delete'>;
+
+function mapCompetitionRow(row: {
+  id: string;
+  name: string;
+  subtitle: string;
+  status: string;
+  registrationsOpen: boolean;
+  requirePhone: boolean;
+  confirmLargeDelta: boolean;
+  largeDeltaThreshold: number;
+  tieBreaker: string;
+  pointsCorrect: number;
+  pointsWrong: number;
+  pointsBonus: number;
+  currentRound: number;
+  roundTitle: string;
+  startedAt: string | null;
+  elapsedSeconds: number;
+  resumedAt: string | null;
+  questionTimerSeconds: number;
+  questionTimerRunning: boolean;
+  questionTimerStartedAt: string | null;
+}): Competition {
   return {
     id: row.id,
     name: row.name,
@@ -63,7 +127,18 @@ function mapCompetitionRow(row: DbCompetitionRow): Competition {
   };
 }
 
-function mapParticipantRow(row: DbParticipantRow): Participant {
+function mapParticipantRow(row: {
+  id: string;
+  firstName: string;
+  lastName: string;
+  nickname: string | null;
+  phone: string | null;
+  avatarUrl: string | null;
+  score: number;
+  status: string;
+  scoreUpdatedAt: string;
+  createdAt: string;
+}): Participant {
   return {
     id: row.id,
     first_name: row.firstName,
@@ -78,7 +153,19 @@ function mapParticipantRow(row: DbParticipantRow): Participant {
   };
 }
 
-function mapEventRow(row: DbScoreEventRow): ScoreEvent {
+function mapEventRow(row: {
+  id: string;
+  participantId: string;
+  participantName: string;
+  delta: number;
+  previousScore: number;
+  newScore: number;
+  reason: string;
+  roundNumber: number;
+  adminName: string;
+  reverted: boolean;
+  createdAt: string;
+}): ScoreEvent {
   return {
     id: row.id,
     participant_id: row.participantId,
@@ -100,7 +187,8 @@ function isPgUniqueViolation(err: unknown): boolean {
   return record.code === '23505' || record.cause?.code === '23505';
 }
 
-async function ensureCompetitionRow(executor: DbExecutor = db): Promise<Competition> {
+async function ensureCompetitionRow(ctx: DrizzleCtx, executor: DbExecutor = ctx.db): Promise<Competition> {
+  const { competitions, eq } = ctx;
   const existing = await executor
     .select()
     .from(competitions)
@@ -115,25 +203,25 @@ async function ensureCompetitionRow(executor: DbExecutor = db): Promise<Competit
     .insert(competitions)
     .values({
       id: 'main',
-      name: 'QUIZ CHAMPION LIVE',
-      subtitle: 'Compétition de culture générale',
-      status: 'PREPARATION',
-      registrationsOpen: true,
-      requirePhone: false,
-      confirmLargeDelta: true,
-      largeDeltaThreshold: 20,
-      tieBreaker: 'EARLIEST_REACHED',
-      pointsCorrect: 10,
-      pointsWrong: -5,
-      pointsBonus: 20,
-      currentRound: 1,
-      roundTitle: 'Manche 1',
-      startedAt: null,
-      elapsedSeconds: 0,
-      resumedAt: null,
-      questionTimerSeconds: 30,
-      questionTimerRunning: false,
-      questionTimerStartedAt: null,
+      name: DEFAULT_COMPETITION.name,
+      subtitle: DEFAULT_COMPETITION.subtitle,
+      status: DEFAULT_COMPETITION.status,
+      registrationsOpen: DEFAULT_COMPETITION.registrations_open,
+      requirePhone: DEFAULT_COMPETITION.require_phone,
+      confirmLargeDelta: DEFAULT_COMPETITION.confirm_large_delta,
+      largeDeltaThreshold: DEFAULT_COMPETITION.large_delta_threshold,
+      tieBreaker: DEFAULT_COMPETITION.tie_breaker,
+      pointsCorrect: DEFAULT_COMPETITION.points_correct,
+      pointsWrong: DEFAULT_COMPETITION.points_wrong,
+      pointsBonus: DEFAULT_COMPETITION.points_bonus,
+      currentRound: DEFAULT_COMPETITION.current_round,
+      roundTitle: DEFAULT_COMPETITION.round_title,
+      startedAt: DEFAULT_COMPETITION.started_at,
+      elapsedSeconds: DEFAULT_COMPETITION.elapsed_seconds,
+      resumedAt: DEFAULT_COMPETITION.resumed_at,
+      questionTimerSeconds: DEFAULT_COMPETITION.question_timer_seconds,
+      questionTimerRunning: DEFAULT_COMPETITION.question_timer_running,
+      questionTimerStartedAt: DEFAULT_COMPETITION.question_timer_started_at,
     })
     .onConflictDoNothing();
 
@@ -157,6 +245,18 @@ export async function upsertAdminUser(
   if (isSupabaseConfigured()) {
     return upsertSupabaseAdminUser(uid, email, name);
   }
+  if (!isCloudSqlConfigured()) {
+    const cleanEmail = email.trim().toLowerCase();
+    const displayName = (name && name.trim()) || cleanEmail.split('@')[0] || 'Régie';
+    const configuredOwner = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    return {
+      uid,
+      email: cleanEmail,
+      name: displayName,
+      role: !configuredOwner || cleanEmail === configuredOwner ? 'SUPER_ADMIN' : 'HOST',
+    };
+  }
+  const { getOrCreateUser } = await getDrizzleCtx();
   const user = await getOrCreateUser(uid, email, name);
   return {
     uid: user.uid,
@@ -170,8 +270,12 @@ export async function getCompetition(): Promise<Competition> {
   if (isSupabaseConfigured()) {
     return getSupabaseCompetition();
   }
+  if (!isCloudSqlConfigured()) {
+    return { ...DEFAULT_COMPETITION };
+  }
   try {
-    return await ensureCompetitionRow(db);
+    const ctx = await getDrizzleCtx();
+    return await ensureCompetitionRow(ctx, ctx.db);
   } catch (error) {
     console.error('Database query failed in getCompetition:', error);
     throw new Error('Impossible de charger la configuration de la compétition.', { cause: error });
@@ -179,11 +283,12 @@ export async function getCompetition(): Promise<Competition> {
 }
 
 async function getRankedParticipantsWithExecutor(
+  ctx: DrizzleCtx,
   executor: DbExecutor,
   tieBreaker?: TieBreakerRule
 ): Promise<RankedParticipant[]> {
-  const resolvedTieBreaker = tieBreaker ?? (await ensureCompetitionRow(executor)).tie_breaker;
-  const rows = await executor.select().from(participants);
+  const resolvedTieBreaker = tieBreaker ?? (await ensureCompetitionRow(ctx, executor)).tie_breaker;
+  const rows = await executor.select().from(ctx.participants);
   return rankParticipants(rows.map(mapParticipantRow), resolvedTieBreaker);
 }
 
@@ -191,8 +296,12 @@ export async function getRankedParticipants(): Promise<RankedParticipant[]> {
   if (isSupabaseConfigured()) {
     return getSupabaseRankedParticipants();
   }
+  if (!isCloudSqlConfigured()) {
+    return [];
+  }
   try {
-    return await getRankedParticipantsWithExecutor(db);
+    const ctx = await getDrizzleCtx();
+    return await getRankedParticipantsWithExecutor(ctx, ctx.db);
   } catch (error) {
     console.error('Database query failed in getRankedParticipants:', error);
     throw new Error('Impossible de charger les participants.', { cause: error });
@@ -203,7 +312,11 @@ export async function getRecentEvents(limit = 100): Promise<ScoreEvent[]> {
   if (isSupabaseConfigured()) {
     return getSupabaseRecentEvents(limit);
   }
+  if (!isCloudSqlConfigured()) {
+    return [];
+  }
   try {
+    const { db, desc, scoreEvents } = await getDrizzleCtx();
     const rows = await db
       .select()
       .from(scoreEvents)
@@ -220,10 +333,19 @@ export async function getFullQuizState(): Promise<FullQuizState> {
   if (isSupabaseConfigured()) {
     return getSupabaseFullQuizState();
   }
+  if (!isCloudSqlConfigured()) {
+    return {
+      competition: { ...DEFAULT_COMPETITION },
+      participants: [],
+      recentEvents: [],
+      serverTime: new Date().toISOString(),
+    };
+  }
   try {
-    const competition = await ensureCompetitionRow(db);
+    const ctx = await getDrizzleCtx();
+    const competition = await ensureCompetitionRow(ctx, ctx.db);
     const [ranked, recent] = await Promise.all([
-      getRankedParticipantsWithExecutor(db, competition.tie_breaker),
+      getRankedParticipantsWithExecutor(ctx, ctx.db, competition.tie_breaker),
       getRecentEvents(100),
     ]);
     return {
@@ -296,9 +418,12 @@ export async function createParticipant(
     throw new Error('INVALID_NAME');
   }
 
+  const ctx = await getDrizzleCtx();
+  const { db, eq, participants } = ctx;
+
   try {
     return await db.transaction(async (tx) => {
-      const comp = await ensureCompetitionRow(tx);
+      const comp = await ensureCompetitionRow(ctx, tx);
       if (!options.bypassRegistrationLock && !comp.registrations_open) {
         throw new Error('REGISTRATIONS_CLOSED');
       }
@@ -355,13 +480,14 @@ export async function createParticipant(
         throw insertErr;
       }
 
-      const ranked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const ranked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const created = ranked.find((p) => p.id === id);
       if (!created) throw new Error('CREATE_FAILED');
       return created;
     });
   } catch (error) {
     if (error instanceof Error && [
+      'DATABASE_NOT_CONFIGURED',
       'REGISTRATIONS_CLOSED',
       'PHONE_REQUIRED',
       'INVALID_NAME',
@@ -394,6 +520,8 @@ export async function updateParticipantDetails(
   if (isSupabaseConfigured()) {
     return updateSupabaseParticipantDetails(id, updates);
   }
+  const ctx = await getDrizzleCtx();
+  const { and, db, eq, ne, participants } = ctx;
   try {
     return await db.transaction(async (tx) => {
       const existingRows = await tx
@@ -440,12 +568,13 @@ export async function updateParticipantDetails(
         })
         .where(eq(participants.id, id));
 
-      const updated = (await getRankedParticipantsWithExecutor(tx)).find((p) => p.id === id);
+      const updated = (await getRankedParticipantsWithExecutor(ctx, tx)).find((p) => p.id === id);
       if (!updated) throw new Error('NOT_FOUND');
       return updated;
     });
   } catch (error) {
     if (error instanceof Error && [
+      'DATABASE_NOT_CONFIGURED',
       'NOT_FOUND',
       'INVALID_NAME',
       'INVALID_AVATAR',
@@ -465,6 +594,7 @@ export async function deleteParticipant(id: string): Promise<void> {
   if (isSupabaseConfigured()) {
     return deleteSupabaseParticipant(id);
   }
+  const { db, eq, participants } = await getDrizzleCtx();
   try {
     const deleted = await db
       .delete(participants)
@@ -498,10 +628,13 @@ export async function applyScoreMutation(
     throw new Error('INVALID_DELTA');
   }
 
+  const ctx = await getDrizzleCtx();
+  const { db, eq, participants, scoreEvents } = ctx;
+
   try {
     return await db.transaction(async (tx) => {
-      const comp = await ensureCompetitionRow(tx);
-      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const comp = await ensureCompetitionRow(ctx, tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
       const pRows = await tx
@@ -544,7 +677,7 @@ export async function applyScoreMutation(
         })
         .returning();
 
-      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const afterRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
 
       return {
@@ -556,6 +689,7 @@ export async function applyScoreMutation(
     });
   } catch (error) {
     if (error instanceof Error && [
+      'DATABASE_NOT_CONFIGURED',
       'INVALID_DELTA',
       'NOT_FOUND',
       'PARTICIPANT_DISQUALIFIED',
@@ -579,10 +713,12 @@ export async function resetSingleParticipantScore(
   if (isSupabaseConfigured()) {
     return resetSupabaseSingleParticipantScore(participantId, adminName);
   }
+  const ctx = await getDrizzleCtx();
+  const { db, eq, participants, scoreEvents } = ctx;
   try {
     return await db.transaction(async (tx) => {
-      const comp = await ensureCompetitionRow(tx);
-      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const comp = await ensureCompetitionRow(ctx, tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
       const pRows = await tx
@@ -621,7 +757,7 @@ export async function resetSingleParticipantScore(
         })
         .returning();
 
-      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const afterRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
 
       return {
@@ -632,7 +768,7 @@ export async function resetSingleParticipantScore(
       };
     });
   } catch (error) {
-    if (error instanceof Error && error.message === 'NOT_FOUND') {
+    if (error instanceof Error && ['DATABASE_NOT_CONFIGURED', 'NOT_FOUND'].includes(error.message)) {
       throw error;
     }
     console.error('Database query failed in resetSingleParticipantScore:', error);
@@ -649,10 +785,12 @@ export async function undoLastScoreOperation(adminName: string): Promise<{
   if (isSupabaseConfigured()) {
     return undoSupabaseLastScoreOperation(adminName);
   }
+  const ctx = await getDrizzleCtx();
+  const { and, db, desc, eq, ne, participants, scoreEvents } = ctx;
   try {
     return await db.transaction(async (tx) => {
-      const comp = await ensureCompetitionRow(tx);
-      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const comp = await ensureCompetitionRow(ctx, tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
       const lastEvents = await tx
@@ -706,7 +844,7 @@ export async function undoLastScoreOperation(adminName: string): Promise<{
         })
         .returning();
 
-      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const afterRanked = await getRankedParticipantsWithExecutor(ctx, tx, comp.tie_breaker);
       const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
 
       return {
@@ -717,7 +855,12 @@ export async function undoLastScoreOperation(adminName: string): Promise<{
       };
     });
   } catch (error) {
-    if (error instanceof Error && ['NOTHING_TO_UNDO', 'PARTICIPANT_NOT_FOUND'].includes(error.message)) {
+    if (
+      error instanceof Error &&
+      ['DATABASE_NOT_CONFIGURED', 'NOTHING_TO_UNDO', 'PARTICIPANT_NOT_FOUND'].includes(
+        error.message
+      )
+    ) {
       throw error;
     }
     console.error('Database query failed in undoLastScoreOperation:', error);
@@ -747,9 +890,11 @@ export async function updateCompetitionConfig(
   if (isSupabaseConfigured()) {
     return updateSupabaseCompetitionConfig(updates);
   }
+  const ctx = await getDrizzleCtx();
+  const { competitions, db, eq } = ctx;
   try {
     return await db.transaction(async (tx) => {
-      const current = await ensureCompetitionRow(tx);
+      const current = await ensureCompetitionRow(ctx, tx);
       const nowMs = Date.now();
       const nowIso = new Date(nowMs).toISOString();
 
@@ -825,6 +970,9 @@ export async function updateCompetitionConfig(
       return mapCompetitionRow(updatedRows[0]);
     });
   } catch (error) {
+    if (error instanceof Error && error.message === 'DATABASE_NOT_CONFIGURED') {
+      throw error;
+    }
     console.error('Database query failed in updateCompetitionConfig:', error);
     throw new Error('Impossible de mettre à jour la compétition.', { cause: error });
   }
@@ -834,10 +982,12 @@ export async function resetCompetitionData(mode: 'scores' | 'full'): Promise<voi
   if (isSupabaseConfigured()) {
     return resetSupabaseCompetitionData(mode);
   }
+  const ctx = await getDrizzleCtx();
+  const { competitions, db, eq, participants, scoreEvents } = ctx;
   const now = new Date().toISOString();
   try {
     await db.transaction(async (tx) => {
-      await ensureCompetitionRow(tx);
+      await ensureCompetitionRow(ctx, tx);
       await tx.delete(scoreEvents);
 
       if (mode === 'full') {
@@ -871,6 +1021,9 @@ export async function resetCompetitionData(mode: 'scores' | 'full'): Promise<voi
       }
     });
   } catch (error) {
+    if (error instanceof Error && error.message === 'DATABASE_NOT_CONFIGURED') {
+      throw error;
+    }
     console.error('Database query failed in resetCompetitionData:', error);
     throw new Error('Impossible de réinitialiser la compétition.', { cause: error });
   }

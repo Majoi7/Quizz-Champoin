@@ -96,6 +96,7 @@ export function getSupabaseConfig(): { url: string; key: string } | null {
     ''
   ).trim();
   if (!url || !key) return null;
+  if (!/^https?:\/\//i.test(url)) return null;
   return { url, key };
 }
 
