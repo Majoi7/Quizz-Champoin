@@ -45,7 +45,14 @@ async function requestJson<T>(url: string, init: RequestInit = {}, withAuth = fa
   const res = await fetch(url, { ...init, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(typeof data?.error === 'string' ? data.error : `Erreur HTTP ${res.status}`);
+    if (res.status === 413) {
+      throw new Error("La photo envoyée est trop volumineuse.");
+    }
+    throw new Error(
+      typeof data?.error === 'string'
+        ? data.error
+        : `Le serveur a répondu avec l'erreur ${res.status}. Veuillez réessayer.`
+    );
   }
   return data as T;
 }

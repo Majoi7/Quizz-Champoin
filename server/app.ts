@@ -32,11 +32,43 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
   initDatabase();
 
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use((req, _res, next) => {
+    const reqWithFlag = req as express.Request & { _body?: boolean };
+    if (req.body !== undefined && !reqWithFlag._body) {
+      reqWithFlag._body = true;
+    }
+    next();
+  });
+  app.use(express.json({ limit: '4mb' }));
 
   const broadcast = (message: ServerWsMessage) => {
-    options.onBroadcast?.(message);
+    try {
+      options.onBroadcast?.(message);
+    } catch (err) {
+      console.warn('[api] Broadcast error ignored:', err);
+    }
   };
+
+  function parseBodyObject(body: unknown): Record<string, unknown> {
+    if (!body) return {};
+    if (typeof body === 'string') {
+      try {
+        const parsed = JSON.parse(body);
+        return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+      } catch {
+        return {};
+      }
+    }
+    if (Buffer.isBuffer(body)) {
+      try {
+        const parsed = JSON.parse(body.toString('utf8'));
+        return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+      } catch {
+        return {};
+      }
+    }
+    return typeof body === 'object' ? (body as Record<string, unknown>) : {};
+  }
 
   function requireAdmin(
     req: AuthedRequest,
@@ -86,12 +118,13 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
 
   app.post('/api/register', (req, res) => {
     try {
+      const body = parseBodyObject(req.body);
       const created = createParticipant({
-        first_name: String(req.body?.first_name ?? ''),
-        last_name: String(req.body?.last_name ?? ''),
-        nickname: req.body?.nickname ? String(req.body.nickname) : null,
-        phone: req.body?.phone ? String(req.body.phone) : null,
-        avatar_url: req.body?.avatar_url ? String(req.body.avatar_url) : null,
+        first_name: typeof body.first_name === 'string' ? body.first_name : String(body.first_name ?? ''),
+        last_name: typeof body.last_name === 'string' ? body.last_name : String(body.last_name ?? ''),
+        nickname: typeof body.nickname === 'string' ? body.nickname : null,
+        phone: typeof body.phone === 'string' ? body.phone : null,
+        avatar_url: typeof body.avatar_url === 'string' ? body.avatar_url : null,
       });
 
       broadcast({
@@ -117,6 +150,10 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(400).json({ error: 'Le numéro de téléphone est obligatoire pour cette session.' });
         return;
       }
+      if (code === 'INVALID_AVATAR') {
+        res.status(400).json({ error: "L'image de profil est invalide ou trop volumineuse." });
+        return;
+      }
       if (code === 'DUPLICATE_PARTICIPANT') {
         res.status(409).json({ error: 'Un participant portant ce nom et prénom est déjà inscrit.' });
         return;
@@ -125,6 +162,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà associé à un participant.' });
         return;
       }
+      console.error('[POST /api/register] unexpected error:', err);
       res.status(500).json({ error: "Erreur lors de l'inscription." });
     }
   });
@@ -153,13 +191,14 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
   // Admin Participant & Scoring Mutations
   app.post('/api/admin/participants', requireAdmin, (req: AuthedRequest, res) => {
     try {
+      const body = parseBodyObject(req.body);
       const created = createParticipant(
         {
-          first_name: String(req.body?.first_name ?? ''),
-          last_name: String(req.body?.last_name ?? ''),
-          nickname: req.body?.nickname ? String(req.body.nickname) : null,
-          phone: req.body?.phone ? String(req.body.phone) : null,
-          avatar_url: req.body?.avatar_url ? String(req.body.avatar_url) : null,
+          first_name: typeof body.first_name === 'string' ? body.first_name : String(body.first_name ?? ''),
+          last_name: typeof body.last_name === 'string' ? body.last_name : String(body.last_name ?? ''),
+          nickname: typeof body.nickname === 'string' ? body.nickname : null,
+          phone: typeof body.phone === 'string' ? body.phone : null,
+          avatar_url: typeof body.avatar_url === 'string' ? body.avatar_url : null,
         },
         { bypassRegistrationLock: true }
       );
@@ -177,6 +216,10 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(400).json({ error: 'Prénom et nom requis (2 caractères minimum).' });
         return;
       }
+      if (code === 'INVALID_AVATAR') {
+        res.status(400).json({ error: "L'image de profil est invalide ou trop volumineuse." });
+        return;
+      }
       if (code === 'DUPLICATE_PARTICIPANT') {
         res.status(409).json({ error: 'Ce participant existe déjà.' });
         return;
@@ -185,6 +228,7 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà utilisé.' });
         return;
       }
+      console.error('[POST /api/admin/participants] unexpected error:', err);
       res.status(500).json({ error: 'Impossible de créer le participant.' });
     }
   });
@@ -328,6 +372,20 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
       payload: fullState,
     });
     res.json(fullState);
+  });
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const errObj = err as { type?: string; status?: number } | null;
+    if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
+      res.status(413).json({ error: "La photo ou les données envoyées sont trop volumineuses." });
+      return;
+    }
+    if (errObj?.type === 'entity.parse.failed' || errObj?.status === 400) {
+      res.status(400).json({ error: 'Requête JSON invalide.' });
+      return;
+    }
+    console.error('[API error middleware]', err);
+    res.status(500).json({ error: 'Erreur interne du serveur.' });
   });
 
   return app;

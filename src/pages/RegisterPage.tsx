@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, CheckCircle2, Lock, Upload, UserPlus } from 'lucide-react';
 import { PublicHeader } from '../components/PublicHeader';
@@ -18,6 +18,46 @@ const PRESET_AVATARS = [
   },
 ];
 
+async function compressAvatarFile(file: File): Promise<string> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') resolve(reader.result);
+      else reject(new Error('READ_FAILED'));
+    };
+    reader.onerror = () => reject(new Error('READ_FAILED'));
+    reader.readAsDataURL(file);
+  });
+
+  if (typeof document === 'undefined') return dataUrl;
+
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('IMG_DECODE_FAILED'));
+      el.src = dataUrl;
+    });
+
+    const maxSize = 256;
+    const scale = Math.min(1, maxSize / Math.max(img.width || 1, img.height || 1));
+    const width = Math.max(1, Math.round((img.width || maxSize) * scale));
+    const height = Math.max(1, Math.round((img.height || maxSize) * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+
+    ctx.drawImage(img, 0, 0, width, height);
+    const compressed = canvas.toDataURL('image/jpeg', 0.82);
+    return compressed.length < dataUrl.length ? compressed : dataUrl;
+  } catch {
+    return dataUrl;
+  }
+}
+
 export function RegisterPage() {
   const { competition } = useQuiz();
 
@@ -29,26 +69,31 @@ export function RegisterPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [registered, setRegistered] = useState<RankedParticipant | null>(null);
+  const submitLockRef = useRef(false);
 
-  const handlePhotoFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > 1_200_000) {
-      setError('La photo ne doit pas dépasser 1,2 Mo.');
+    if (file.size > 10_000_000) {
+      setError('La photo ne doit pas dépasser 10 Mo.');
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setAvatarUrl(reader.result);
-        setError(null);
+    try {
+      const processed = await compressAvatarFile(file);
+      if (processed.length > 420_000) {
+        setError('La photo reste trop volumineuse après compression.');
+        return;
       }
-    };
-    reader.readAsDataURL(file);
+      setAvatarUrl(processed);
+      setError(null);
+    } catch {
+      setError("Impossible de charger l'image sélectionnée.");
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitLockRef.current) return;
     setError(null);
 
     if (firstName.trim().length < 2 || lastName.trim().length < 2) {
@@ -60,6 +105,7 @@ export function RegisterPage() {
       return;
     }
 
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       const res = await quizApi.registerParticipant({
@@ -73,6 +119,7 @@ export function RegisterPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Impossible de finaliser l'inscription.");
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   };

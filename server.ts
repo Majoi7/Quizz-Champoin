@@ -14,7 +14,11 @@ function broadcastWs(message: ServerWsMessage): void {
   const raw = JSON.stringify(message);
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(raw);
+      try {
+        client.send(raw);
+      } catch {
+        // Ignore broken WebSocket client
+      }
     }
   }
 }
@@ -24,12 +28,16 @@ const server = http.createServer(app);
 wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
-  ws.send(
-    JSON.stringify({
-      type: 'state:sync',
-      payload: getFullQuizState(),
-    } satisfies ServerWsMessage)
-  );
+  try {
+    ws.send(
+      JSON.stringify({
+        type: 'state:sync',
+        payload: getFullQuizState(),
+      } satisfies ServerWsMessage)
+    );
+  } catch {
+    // Ignore transient closed socket during handshake
+  }
 });
 
 async function startServer(): Promise<void> {

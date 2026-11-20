@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   normalizeParticipantKey,
@@ -19,32 +20,62 @@ import type {
   TieBreakerRule,
 } from '../src/types/quiz';
 
-function resolveDbPath(): string {
-  const customPath = process.env.SQLITE_PATH?.trim();
-  if (customPath) {
-    const dir = path.dirname(customPath);
+function isDirWritable(dir: string): boolean {
+  try {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    return customPath;
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveDbPath(): string {
+  const customPath = process.env.SQLITE_PATH?.trim();
+  if (customPath) {
+    if (customPath === ':memory:') return customPath;
+    const dir = path.dirname(customPath);
+    if (isDirWritable(dir)) {
+      return customPath;
+    }
   }
 
   if (process.env.VERCEL) {
-    return path.join('/tmp', 'quiz.sqlite');
+    return path.join(os.tmpdir(), 'quiz.sqlite');
   }
 
   const dataDir = path.resolve(process.cwd(), 'data');
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
+  if (isDirWritable(dataDir)) {
+    return path.join(dataDir, 'quiz.sqlite');
   }
-  return path.join(dataDir, 'quiz.sqlite');
+
+  return path.join(os.tmpdir(), 'quiz.sqlite');
 }
 
-const DB_PATH = resolveDbPath();
-export const db = new Database(DB_PATH);
-db.pragma('busy_timeout = 5000');
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+function openDatabaseSafely(): Database.Database {
+  const targetPath = resolveDbPath();
+  try {
+    return new Database(targetPath);
+  } catch (err) {
+    console.warn(`[db] Failed to open SQLite at ${targetPath}, falling back to tmp/memory:`, err);
+    try {
+      return new Database(path.join(os.tmpdir(), 'quiz.sqlite'));
+    } catch {
+      return new Database(':memory:');
+    }
+  }
+}
+
+export const db = openDatabaseSafely();
+try {
+  db.pragma('busy_timeout = 8000');
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+} catch (err) {
+  console.warn('[db] Non-fatal SQLite pragma warning:', err);
+}
 
 function hashPassword(password: string, salt?: string): string {
   const actualSalt = salt ?? crypto.randomBytes(16).toString('hex');
@@ -204,7 +235,7 @@ export function initDatabase(): void {
     }
   });
 
-  bootstrap.immediate();
+  withSqliteRetry(() => bootstrap.immediate());
   dbInitialized = true;
 }
 
@@ -268,7 +299,19 @@ function mapEventRow(row: Record<string, unknown>): ScoreEvent {
 
 export function getCompetition(): Competition {
   initDatabase();
-  const row = db.prepare('SELECT * FROM competitions WHERE id = ?').get('main') as Record<string, unknown>;
+  let row = db.prepare('SELECT * FROM competitions WHERE id = ?').get('main') as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) {
+    dbInitialized = false;
+    initDatabase();
+    row = db.prepare('SELECT * FROM competitions WHERE id = ?').get('main') as
+      | Record<string, unknown>
+      | undefined;
+  }
+  if (!row) {
+    throw new Error('COMPETITION_NOT_INITIALIZED');
+  }
   return mapCompetitionRow(row);
 }
 
@@ -368,63 +411,150 @@ export interface RegisterInput {
   avatar_url?: string | null;
 }
 
+const MAX_AVATAR_URL_LENGTH = 450_000;
+
+function sanitizeAvatarUrl(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > MAX_AVATAR_URL_LENGTH) {
+    throw new Error('INVALID_AVATAR');
+  }
+  if (
+    trimmed.startsWith('data:image/') ||
+    trimmed.startsWith('https://') ||
+    trimmed.startsWith('http://') ||
+    trimmed.startsWith('/')
+  ) {
+    return trimmed;
+  }
+  throw new Error('INVALID_AVATAR');
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  const message = (err as { message?: unknown }).message;
+  return (
+    code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+    code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
+    (typeof message === 'string' && message.includes('UNIQUE constraint failed'))
+  );
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  const message = (err as { message?: unknown }).message;
+  return (
+    code === 'SQLITE_BUSY' ||
+    code === 'SQLITE_LOCKED' ||
+    (typeof message === 'string' && /database is locked|SQLITE_BUSY/i.test(message))
+  );
+}
+
+function withSqliteRetry<T>(fn: () => T, maxAttempts = 4): T {
+  let attempt = 0;
+  while (true) {
+    try {
+      return fn();
+    } catch (err) {
+      attempt += 1;
+      if (!isSqliteBusyError(err) || attempt >= maxAttempts) {
+        throw err;
+      }
+      const waitUntil = Date.now() + 25 * attempt;
+      while (Date.now() < waitUntil) {
+        // brief synchronous backoff for SQLite write lock contention
+      }
+    }
+  }
+}
+
 export function createParticipant(
   input: RegisterInput,
   options: { bypassRegistrationLock?: boolean } = {}
 ): RankedParticipant {
   initDatabase();
-  const comp = getCompetition();
-  if (!options.bypassRegistrationLock && !comp.registrations_open) {
-    throw new Error('REGISTRATIONS_CLOSED');
-  }
 
-  const firstName = input.first_name.trim();
-  const lastName = input.last_name.trim();
-  const nickname = input.nickname?.trim() || null;
-  const phone = input.phone?.trim() || null;
-  const avatarUrl = input.avatar_url?.trim() || null;
+  const firstName = String(input.first_name ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const lastName = String(input.last_name ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const nickname =
+    typeof input.nickname === 'string' ? input.nickname.replace(/\s+/g, ' ').trim() || null : null;
+  const phone =
+    typeof input.phone === 'string' ? input.phone.replace(/\s+/g, ' ').trim() || null : null;
+  const avatarUrl = sanitizeAvatarUrl(input.avatar_url);
 
-  if (firstName.length < 2 || lastName.length < 2) {
+  if (firstName.length < 2 || lastName.length < 2 || firstName.length > 80 || lastName.length > 80) {
     throw new Error('INVALID_NAME');
   }
 
-  if (!options.bypassRegistrationLock && comp.require_phone && !phone) {
-    throw new Error('PHONE_REQUIRED');
-  }
-
-  const normalizedKey = normalizeParticipantKey(firstName, lastName);
-  const existingByName = db
-    .prepare('SELECT id FROM participants WHERE normalized_key = ?')
-    .get(normalizedKey);
-  if (existingByName) {
-    throw new Error('DUPLICATE_PARTICIPANT');
-  }
-
-  if (phone) {
-    const cleanPhone = phone.replace(/\s+/g, '');
-    const allPhones = db
-      .prepare('SELECT id, phone FROM participants WHERE phone IS NOT NULL')
-      .all() as { id: string; phone: string }[];
-    const phoneMatch = allPhones.find((p) => p.phone.replace(/\s+/g, '') === cleanPhone);
-    if (phoneMatch) {
-      throw new Error('DUPLICATE_PHONE');
+  const tx = db.transaction(() => {
+    const comp = getCompetition();
+    if (!options.bypassRegistrationLock && !comp.registrations_open) {
+      throw new Error('REGISTRATIONS_CLOSED');
     }
+
+    if (!options.bypassRegistrationLock && comp.require_phone && !phone) {
+      throw new Error('PHONE_REQUIRED');
+    }
+
+    const normalizedKey = normalizeParticipantKey(firstName, lastName);
+    const existingByName = db
+      .prepare('SELECT id FROM participants WHERE normalized_key = ?')
+      .get(normalizedKey);
+    if (existingByName) {
+      throw new Error('DUPLICATE_PARTICIPANT');
+    }
+
+    if (phone) {
+      const cleanPhone = phone.replace(/\s+/g, '');
+      const allPhones = db
+        .prepare('SELECT id, phone FROM participants WHERE phone IS NOT NULL')
+        .all() as { id: string; phone: string | null }[];
+      const phoneMatch = allPhones.find(
+        (p) => String(p.phone ?? '').replace(/\s+/g, '') === cleanPhone
+      );
+      if (phoneMatch) {
+        throw new Error('DUPLICATE_PHONE');
+      }
+    }
+
+    const now = new Date().toISOString();
+    const id = `p_${crypto.randomBytes(8).toString('hex')}`;
+
+    try {
+      db.prepare(`
+        INSERT INTO participants (
+          id, first_name, last_name, nickname, phone, avatar_url, score,
+          status, score_updated_at, created_at, normalized_key
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, 'ACTIVE', ?, ?, ?)
+      `).run(id, firstName, lastName, nickname, phone, avatarUrl, now, now, normalizedKey);
+    } catch (err) {
+      if (isUniqueConstraintError(err)) {
+        throw new Error('DUPLICATE_PARTICIPANT');
+      }
+      throw err;
+    }
+
+    const ranked = getRankedParticipants();
+    const created = ranked.find((p) => p.id === id);
+    if (!created) throw new Error('CREATE_FAILED');
+    return created;
+  });
+
+  try {
+    return withSqliteRetry(() => tx.immediate());
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      throw new Error('DUPLICATE_PARTICIPANT');
+    }
+    throw err;
   }
-
-  const now = new Date().toISOString();
-  const id = `p_${crypto.randomBytes(6).toString('hex')}`;
-
-  db.prepare(`
-    INSERT INTO participants (
-      id, first_name, last_name, nickname, phone, avatar_url, score,
-      status, score_updated_at, created_at, normalized_key
-    ) VALUES (?, ?, ?, ?, ?, ?, 0, 'ACTIVE', ?, ?, ?)
-  `).run(id, firstName, lastName, nickname, phone, avatarUrl, now, now, normalizedKey);
-
-  const ranked = getRankedParticipants();
-  const created = ranked.find((p) => p.id === id);
-  if (!created) throw new Error('CREATE_FAILED');
-  return created;
 }
 
 export function updateParticipantDetails(
