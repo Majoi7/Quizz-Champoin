@@ -1,14 +1,26 @@
-import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { and, desc, eq, ne } from 'drizzle-orm';
+import { db } from '../src/db/index.ts';
+import { competitions, participants, scoreEvents } from '../src/db/schema.ts';
+import { getOrCreateUser } from '../src/db/users.ts';
+import { normalizeParticipantKey, rankParticipants } from '../src/lib/ranking.ts';
 import {
-  normalizeParticipantKey,
-  rankParticipants,
-} from '../src/lib/ranking';
+  applySupabaseScoreMutation,
+  createSupabaseParticipant,
+  deleteSupabaseParticipant,
+  getSupabaseCompetition,
+  getSupabaseFullQuizState,
+  getSupabaseRankedParticipants,
+  getSupabaseRecentEvents,
+  isSupabaseConfigured,
+  resetSupabaseCompetitionData,
+  resetSupabaseSingleParticipantScore,
+  undoSupabaseLastScoreOperation,
+  updateSupabaseCompetitionConfig,
+  updateSupabaseParticipantDetails,
+  upsertSupabaseAdminUser,
+} from './supabaseDb.ts';
 import type {
-  AdminUser,
   Competition,
   CompetitionStatus,
   FullQuizState,
@@ -18,389 +30,212 @@ import type {
   ScoreEvent,
   ScoreReason,
   TieBreakerRule,
-} from '../src/types/quiz';
+} from '../src/types/quiz.ts';
 
-function isDirWritable(dir: string): boolean {
-  try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.accessSync(dir, fs.constants.W_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
+type DbCompetitionRow = typeof competitions.$inferSelect;
+type DbParticipantRow = typeof participants.$inferSelect;
+type DbScoreEventRow = typeof scoreEvents.$inferSelect;
 
-function resolveDbPath(): string {
-  const customPath = process.env.SQLITE_PATH?.trim();
-  if (customPath) {
-    if (customPath === ':memory:') return customPath;
-    const dir = path.dirname(customPath);
-    if (isDirWritable(dir)) {
-      return customPath;
-    }
-  }
+type DbExecutor = Pick<typeof db, 'select' | 'insert' | 'update' | 'delete'>;
 
-  if (process.env.VERCEL) {
-    return path.join(os.tmpdir(), 'quiz.sqlite');
-  }
-
-  const dataDir = path.resolve(process.cwd(), 'data');
-  if (isDirWritable(dataDir)) {
-    return path.join(dataDir, 'quiz.sqlite');
-  }
-
-  return path.join(os.tmpdir(), 'quiz.sqlite');
-}
-
-function openDatabaseSafely(): Database.Database {
-  const targetPath = resolveDbPath();
-  try {
-    return new Database(targetPath);
-  } catch (err) {
-    console.warn(`[db] Failed to open SQLite at ${targetPath}, falling back to tmp/memory:`, err);
-    try {
-      return new Database(path.join(os.tmpdir(), 'quiz.sqlite'));
-    } catch {
-      return new Database(':memory:');
-    }
-  }
-}
-
-export const db = openDatabaseSafely();
-try {
-  db.pragma('busy_timeout = 8000');
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-} catch (err) {
-  console.warn('[db] Non-fatal SQLite pragma warning:', err);
-}
-
-function hashPassword(password: string, salt?: string): string {
-  const actualSalt = salt ?? crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, actualSalt, 64).toString('hex');
-  return `${actualSalt}:${derived}`;
-}
-
-function verifyPassword(password: string, storedHash: string): boolean {
-  const [salt, key] = storedHash.split(':');
-  if (!salt || !key) return false;
-  const derived = crypto.scryptSync(password, salt, 64);
-  const keyBuf = Buffer.from(key, 'hex');
-  if (derived.length !== keyBuf.length) return false;
-  return crypto.timingSafeEqual(derived, keyBuf);
-}
-
-let dbInitialized = false;
-
-export function initDatabase(): void {
-  if (dbInitialized) return;
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS competitions (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      subtitle TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PREPARATION',
-      registrations_open INTEGER NOT NULL DEFAULT 1,
-      require_phone INTEGER NOT NULL DEFAULT 0,
-      confirm_large_delta INTEGER NOT NULL DEFAULT 1,
-      large_delta_threshold INTEGER NOT NULL DEFAULT 20,
-      tie_breaker TEXT NOT NULL DEFAULT 'EARLIEST_REACHED',
-      points_correct INTEGER NOT NULL DEFAULT 10,
-      points_wrong INTEGER NOT NULL DEFAULT -5,
-      points_bonus INTEGER NOT NULL DEFAULT 20,
-      current_round INTEGER NOT NULL DEFAULT 1,
-      round_title TEXT NOT NULL DEFAULT 'Manche 1',
-      started_at TEXT,
-      elapsed_seconds INTEGER NOT NULL DEFAULT 0,
-      resumed_at TEXT,
-      question_timer_seconds INTEGER NOT NULL DEFAULT 30,
-      question_timer_running INTEGER NOT NULL DEFAULT 0,
-      question_timer_started_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS participants (
-      id TEXT PRIMARY KEY,
-      first_name TEXT NOT NULL,
-      last_name TEXT NOT NULL,
-      nickname TEXT,
-      phone TEXT,
-      avatar_url TEXT,
-      score INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'ACTIVE',
-      score_updated_at TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      normalized_key TEXT NOT NULL UNIQUE
-    );
-
-    CREATE TABLE IF NOT EXISTS score_events (
-      id TEXT PRIMARY KEY,
-      participant_id TEXT NOT NULL,
-      participant_name TEXT NOT NULL,
-      delta INTEGER NOT NULL,
-      previous_score INTEGER NOT NULL,
-      new_score INTEGER NOT NULL,
-      reason TEXT NOT NULL,
-      round_number INTEGER NOT NULL DEFAULT 1,
-      admin_name TEXT NOT NULL,
-      reverted INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS admins (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'SUPER_ADMIN',
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS admin_sessions (
-      token TEXT PRIMARY KEY,
-      admin_id TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
-    );
-  `);
-
-  const now = new Date().toISOString();
-  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@quizchampion.live').trim();
-  const adminName = (process.env.ADMIN_NAME || 'Régie Principale').trim();
-  const adminPasscode = process.env.ADMIN_PASSCODE || 'CHAMPION2026';
-
-  const bootstrap = db.transaction(() => {
-    db.prepare(`
-      INSERT OR IGNORE INTO competitions (
-        id, name, subtitle, status, registrations_open, require_phone,
-        confirm_large_delta, large_delta_threshold, tie_breaker,
-        points_correct, points_wrong, points_bonus, current_round, round_title,
-        started_at, elapsed_seconds, resumed_at, question_timer_seconds,
-        question_timer_running, question_timer_started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      'main',
-      'QUIZ CHAMPION LIVE',
-      'Compétition de culture générale',
-      'PREPARATION',
-      1,
-      0,
-      1,
-      20,
-      'EARLIEST_REACHED',
-      10,
-      -5,
-      20,
-      1,
-      'Manche 1',
-      null,
-      0,
-      null,
-      30,
-      0,
-      null
-    );
-
-    const existingByEmail = db
-      .prepare('SELECT id FROM admins WHERE lower(email) = lower(?)')
-      .get(adminEmail) as { id: string } | undefined;
-
-    if (!existingByEmail) {
-      const existingById = db
-        .prepare('SELECT id FROM admins WHERE id = ?')
-        .get('adm_principal') as { id: string } | undefined;
-
-      if (existingById) {
-        db.prepare(`
-          UPDATE admins
-          SET email = ?, name = ?, password_hash = ?
-          WHERE id = ?
-        `).run(adminEmail, adminName, hashPassword(adminPasscode), 'adm_principal');
-      } else {
-        db.prepare(`
-          INSERT OR IGNORE INTO admins (id, email, name, role, password_hash, created_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
-          'adm_principal',
-          adminEmail,
-          adminName,
-          'SUPER_ADMIN',
-          hashPassword(adminPasscode),
-          now
-        );
-      }
-    }
-  });
-
-  withSqliteRetry(() => bootstrap.immediate());
-  dbInitialized = true;
-}
-
-function mapCompetitionRow(row: Record<string, unknown>): Competition {
+function mapCompetitionRow(row: DbCompetitionRow): Competition {
   return {
-    id: String(row.id),
-    name: String(row.name),
-    subtitle: String(row.subtitle),
+    id: row.id,
+    name: row.name,
+    subtitle: row.subtitle,
     status: row.status as CompetitionStatus,
-    registrations_open: Boolean(row.registrations_open),
-    require_phone: Boolean(row.require_phone),
-    confirm_large_delta: Boolean(row.confirm_large_delta),
-    large_delta_threshold: Number(row.large_delta_threshold),
-    tie_breaker: row.tie_breaker as TieBreakerRule,
-    points_correct: Number(row.points_correct),
-    points_wrong: Number(row.points_wrong),
-    points_bonus: Number(row.points_bonus),
-    current_round: Number(row.current_round),
-    round_title: String(row.round_title),
-    started_at: row.started_at ? String(row.started_at) : null,
-    elapsed_seconds: Number(row.elapsed_seconds),
-    resumed_at: row.resumed_at ? String(row.resumed_at) : null,
-    question_timer_seconds: Number(row.question_timer_seconds),
-    question_timer_running: Boolean(row.question_timer_running),
-    question_timer_started_at: row.question_timer_started_at
-      ? String(row.question_timer_started_at)
-      : null,
+    registrations_open: row.registrationsOpen,
+    require_phone: row.requirePhone,
+    confirm_large_delta: row.confirmLargeDelta,
+    large_delta_threshold: row.largeDeltaThreshold,
+    tie_breaker: row.tieBreaker as TieBreakerRule,
+    points_correct: row.pointsCorrect,
+    points_wrong: row.pointsWrong,
+    points_bonus: row.pointsBonus,
+    current_round: row.currentRound,
+    round_title: row.roundTitle,
+    started_at: row.startedAt,
+    elapsed_seconds: row.elapsedSeconds,
+    resumed_at: row.resumedAt,
+    question_timer_seconds: row.questionTimerSeconds,
+    question_timer_running: row.questionTimerRunning,
+    question_timer_started_at: row.questionTimerStartedAt,
   };
 }
 
-function mapParticipantRow(row: Record<string, unknown>): Participant {
+function mapParticipantRow(row: DbParticipantRow): Participant {
   return {
-    id: String(row.id),
-    first_name: String(row.first_name),
-    last_name: String(row.last_name),
-    nickname: row.nickname ? String(row.nickname) : null,
-    phone: row.phone ? String(row.phone) : null,
-    avatar_url: row.avatar_url ? String(row.avatar_url) : null,
-    score: Number(row.score),
+    id: row.id,
+    first_name: row.firstName,
+    last_name: row.lastName,
+    nickname: row.nickname,
+    phone: row.phone,
+    avatar_url: row.avatarUrl,
+    score: row.score,
     status: row.status as ParticipantStatus,
-    score_updated_at: String(row.score_updated_at),
-    created_at: String(row.created_at),
+    score_updated_at: row.scoreUpdatedAt,
+    created_at: row.createdAt,
   };
 }
 
-function mapEventRow(row: Record<string, unknown>): ScoreEvent {
+function mapEventRow(row: DbScoreEventRow): ScoreEvent {
   return {
-    id: String(row.id),
-    participant_id: String(row.participant_id),
-    participant_name: String(row.participant_name),
-    delta: Number(row.delta),
-    previous_score: Number(row.previous_score),
-    new_score: Number(row.new_score),
+    id: row.id,
+    participant_id: row.participantId,
+    participant_name: row.participantName,
+    delta: row.delta,
+    previous_score: row.previousScore,
+    new_score: row.newScore,
     reason: row.reason as ScoreReason,
-    round_number: Number(row.round_number),
-    admin_name: String(row.admin_name),
-    reverted: Boolean(row.reverted),
-    created_at: String(row.created_at),
+    round_number: row.roundNumber,
+    admin_name: row.adminName,
+    reverted: row.reverted,
+    created_at: row.createdAt,
   };
 }
 
-export function getCompetition(): Competition {
-  initDatabase();
-  let row = db.prepare('SELECT * FROM competitions WHERE id = ?').get('main') as
-    | Record<string, unknown>
-    | undefined;
-  if (!row) {
-    dbInitialized = false;
-    initDatabase();
-    row = db.prepare('SELECT * FROM competitions WHERE id = ?').get('main') as
-      | Record<string, unknown>
-      | undefined;
+function isPgUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const record = err as { code?: unknown; cause?: { code?: unknown } };
+  return record.code === '23505' || record.cause?.code === '23505';
+}
+
+async function ensureCompetitionRow(executor: DbExecutor = db): Promise<Competition> {
+  const existing = await executor
+    .select()
+    .from(competitions)
+    .where(eq(competitions.id, 'main'))
+    .limit(1);
+
+  if (existing[0]) {
+    return mapCompetitionRow(existing[0]);
   }
-  if (!row) {
+
+  await executor
+    .insert(competitions)
+    .values({
+      id: 'main',
+      name: 'QUIZ CHAMPION LIVE',
+      subtitle: 'Compétition de culture générale',
+      status: 'PREPARATION',
+      registrationsOpen: true,
+      requirePhone: false,
+      confirmLargeDelta: true,
+      largeDeltaThreshold: 20,
+      tieBreaker: 'EARLIEST_REACHED',
+      pointsCorrect: 10,
+      pointsWrong: -5,
+      pointsBonus: 20,
+      currentRound: 1,
+      roundTitle: 'Manche 1',
+      startedAt: null,
+      elapsedSeconds: 0,
+      resumedAt: null,
+      questionTimerSeconds: 30,
+      questionTimerRunning: false,
+      questionTimerStartedAt: null,
+    })
+    .onConflictDoNothing();
+
+  const created = await executor
+    .select()
+    .from(competitions)
+    .where(eq(competitions.id, 'main'))
+    .limit(1);
+
+  if (!created[0]) {
     throw new Error('COMPETITION_NOT_INITIALIZED');
   }
-  return mapCompetitionRow(row);
+  return mapCompetitionRow(created[0]);
 }
 
-export function getRankedParticipants(): RankedParticipant[] {
-  initDatabase();
-  const comp = getCompetition();
-  const rows = db.prepare('SELECT * FROM participants').all() as Record<string, unknown>[];
-  return rankParticipants(rows.map(mapParticipantRow), comp.tie_breaker);
-}
-
-export function getRecentEvents(limit = 100): ScoreEvent[] {
-  initDatabase();
-  const rows = db
-    .prepare('SELECT * FROM score_events ORDER BY created_at DESC LIMIT ?')
-    .all(limit) as Record<string, unknown>[];
-  return rows.map(mapEventRow);
-}
-
-export function getFullQuizState(): FullQuizState {
-  initDatabase();
-  return {
-    competition: getCompetition(),
-    participants: getRankedParticipants(),
-    recentEvents: getRecentEvents(100),
-    serverTime: new Date().toISOString(),
-  };
-}
-
-export function authenticateAdmin(
+export async function upsertAdminUser(
+  uid: string,
   email: string,
-  passcode: string
-): { token: string; admin: AdminUser } | null {
-  initDatabase();
-  const row = db
-    .prepare('SELECT * FROM admins WHERE lower(email) = lower(?)')
-    .get(email.trim()) as Record<string, unknown> | undefined;
-
-  if (!row || !verifyPassword(passcode, String(row.password_hash))) {
-    return null;
+  name?: string
+): Promise<{ uid: string; email: string; name: string; role: 'SUPER_ADMIN' | 'HOST' }> {
+  if (isSupabaseConfigured()) {
+    return upsertSupabaseAdminUser(uid, email, name);
   }
-
-  const token = crypto.randomBytes(32).toString('hex');
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
-
-  db.prepare(
-    'INSERT INTO admin_sessions (token, admin_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-  ).run(token, String(row.id), expiresAt, now.toISOString());
-
+  const user = await getOrCreateUser(uid, email, name);
   return {
-    token,
-    admin: {
-      id: String(row.id),
-      email: String(row.email),
-      name: String(row.name),
-      role: row.role as 'SUPER_ADMIN' | 'HOST',
-    },
+    uid: user.uid,
+    email: user.email,
+    name: user.name,
+    role: user.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : 'HOST',
   };
 }
 
-export function getAdminByToken(token: string | undefined): AdminUser | null {
-  initDatabase();
-  if (!token) return null;
-  const row = db
-    .prepare(`
-      SELECT a.id, a.email, a.name, a.role, s.expires_at
-      FROM admin_sessions s
-      JOIN admins a ON a.id = s.admin_id
-      WHERE s.token = ?
-    `)
-    .get(token) as Record<string, unknown> | undefined;
-
-  if (!row) return null;
-  if (Date.parse(String(row.expires_at)) < Date.now()) {
-    db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
-    return null;
+export async function getCompetition(): Promise<Competition> {
+  if (isSupabaseConfigured()) {
+    return getSupabaseCompetition();
   }
-
-  return {
-    id: String(row.id),
-    email: String(row.email),
-    name: String(row.name),
-    role: row.role as 'SUPER_ADMIN' | 'HOST',
-  };
+  try {
+    return await ensureCompetitionRow(db);
+  } catch (error) {
+    console.error('Database query failed in getCompetition:', error);
+    throw new Error('Impossible de charger la configuration de la compétition.', { cause: error });
+  }
 }
 
-export function revokeAdminSession(token: string): void {
-  initDatabase();
-  db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
+async function getRankedParticipantsWithExecutor(
+  executor: DbExecutor,
+  tieBreaker?: TieBreakerRule
+): Promise<RankedParticipant[]> {
+  const resolvedTieBreaker = tieBreaker ?? (await ensureCompetitionRow(executor)).tie_breaker;
+  const rows = await executor.select().from(participants);
+  return rankParticipants(rows.map(mapParticipantRow), resolvedTieBreaker);
+}
+
+export async function getRankedParticipants(): Promise<RankedParticipant[]> {
+  if (isSupabaseConfigured()) {
+    return getSupabaseRankedParticipants();
+  }
+  try {
+    return await getRankedParticipantsWithExecutor(db);
+  } catch (error) {
+    console.error('Database query failed in getRankedParticipants:', error);
+    throw new Error('Impossible de charger les participants.', { cause: error });
+  }
+}
+
+export async function getRecentEvents(limit = 100): Promise<ScoreEvent[]> {
+  if (isSupabaseConfigured()) {
+    return getSupabaseRecentEvents(limit);
+  }
+  try {
+    const rows = await db
+      .select()
+      .from(scoreEvents)
+      .orderBy(desc(scoreEvents.createdAt))
+      .limit(limit);
+    return rows.map(mapEventRow);
+  } catch (error) {
+    console.error('Database query failed in getRecentEvents:', error);
+    throw new Error("Impossible de charger l'historique des scores.", { cause: error });
+  }
+}
+
+export async function getFullQuizState(): Promise<FullQuizState> {
+  if (isSupabaseConfigured()) {
+    return getSupabaseFullQuizState();
+  }
+  try {
+    const competition = await ensureCompetitionRow(db);
+    const [ranked, recent] = await Promise.all([
+      getRankedParticipantsWithExecutor(db, competition.tie_breaker),
+      getRecentEvents(100),
+    ]);
+    return {
+      competition,
+      participants: ranked,
+      recentEvents: recent,
+      serverTime: new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error('Database query failed in getFullQuizState:', error);
+    throw new Error('Impossible de charger l’état du quiz.', { cause: error });
+  }
 }
 
 export interface RegisterInput {
@@ -431,52 +266,13 @@ function sanitizeAvatarUrl(raw: string | null | undefined): string | null {
   throw new Error('INVALID_AVATAR');
 }
 
-function isUniqueConstraintError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const code = (err as { code?: unknown }).code;
-  const message = (err as { message?: unknown }).message;
-  return (
-    code === 'SQLITE_CONSTRAINT_UNIQUE' ||
-    code === 'SQLITE_CONSTRAINT_PRIMARYKEY' ||
-    (typeof message === 'string' && message.includes('UNIQUE constraint failed'))
-  );
-}
-
-function isSqliteBusyError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const code = (err as { code?: unknown }).code;
-  const message = (err as { message?: unknown }).message;
-  return (
-    code === 'SQLITE_BUSY' ||
-    code === 'SQLITE_LOCKED' ||
-    (typeof message === 'string' && /database is locked|SQLITE_BUSY/i.test(message))
-  );
-}
-
-function withSqliteRetry<T>(fn: () => T, maxAttempts = 4): T {
-  let attempt = 0;
-  while (true) {
-    try {
-      return fn();
-    } catch (err) {
-      attempt += 1;
-      if (!isSqliteBusyError(err) || attempt >= maxAttempts) {
-        throw err;
-      }
-      const waitUntil = Date.now() + 25 * attempt;
-      while (Date.now() < waitUntil) {
-        // brief synchronous backoff for SQLite write lock contention
-      }
-    }
-  }
-}
-
-export function createParticipant(
+export async function createParticipant(
   input: RegisterInput,
   options: { bypassRegistrationLock?: boolean } = {}
-): RankedParticipant {
-  initDatabase();
-
+): Promise<RankedParticipant> {
+  if (isSupabaseConfigured()) {
+    return createSupabaseParticipant(input, options);
+  }
   const firstName = String(input.first_name ?? '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -484,80 +280,107 @@ export function createParticipant(
     .replace(/\s+/g, ' ')
     .trim();
   const nickname =
-    typeof input.nickname === 'string' ? input.nickname.replace(/\s+/g, ' ').trim() || null : null;
+    typeof input.nickname === 'string'
+      ? input.nickname.replace(/\s+/g, ' ').trim() || null
+      : null;
   const phone =
     typeof input.phone === 'string' ? input.phone.replace(/\s+/g, ' ').trim() || null : null;
   const avatarUrl = sanitizeAvatarUrl(input.avatar_url);
 
-  if (firstName.length < 2 || lastName.length < 2 || firstName.length > 80 || lastName.length > 80) {
+  if (
+    firstName.length < 2 ||
+    lastName.length < 2 ||
+    firstName.length > 80 ||
+    lastName.length > 80
+  ) {
     throw new Error('INVALID_NAME');
   }
 
-  const tx = db.transaction(() => {
-    const comp = getCompetition();
-    if (!options.bypassRegistrationLock && !comp.registrations_open) {
-      throw new Error('REGISTRATIONS_CLOSED');
-    }
-
-    if (!options.bypassRegistrationLock && comp.require_phone && !phone) {
-      throw new Error('PHONE_REQUIRED');
-    }
-
-    const normalizedKey = normalizeParticipantKey(firstName, lastName);
-    const existingByName = db
-      .prepare('SELECT id FROM participants WHERE normalized_key = ?')
-      .get(normalizedKey);
-    if (existingByName) {
-      throw new Error('DUPLICATE_PARTICIPANT');
-    }
-
-    if (phone) {
-      const cleanPhone = phone.replace(/\s+/g, '');
-      const allPhones = db
-        .prepare('SELECT id, phone FROM participants WHERE phone IS NOT NULL')
-        .all() as { id: string; phone: string | null }[];
-      const phoneMatch = allPhones.find(
-        (p) => String(p.phone ?? '').replace(/\s+/g, '') === cleanPhone
-      );
-      if (phoneMatch) {
-        throw new Error('DUPLICATE_PHONE');
+  try {
+    return await db.transaction(async (tx) => {
+      const comp = await ensureCompetitionRow(tx);
+      if (!options.bypassRegistrationLock && !comp.registrations_open) {
+        throw new Error('REGISTRATIONS_CLOSED');
       }
-    }
 
-    const now = new Date().toISOString();
-    const id = `p_${crypto.randomBytes(8).toString('hex')}`;
+      if (!options.bypassRegistrationLock && comp.require_phone && !phone) {
+        throw new Error('PHONE_REQUIRED');
+      }
 
-    try {
-      db.prepare(`
-        INSERT INTO participants (
-          id, first_name, last_name, nickname, phone, avatar_url, score,
-          status, score_updated_at, created_at, normalized_key
-        ) VALUES (?, ?, ?, ?, ?, ?, 0, 'ACTIVE', ?, ?, ?)
-      `).run(id, firstName, lastName, nickname, phone, avatarUrl, now, now, normalizedKey);
-    } catch (err) {
-      if (isUniqueConstraintError(err)) {
+      const normalizedKey = normalizeParticipantKey(firstName, lastName);
+      const existingByName = await tx
+        .select({ id: participants.id })
+        .from(participants)
+        .where(eq(participants.normalizedKey, normalizedKey))
+        .limit(1);
+
+      if (existingByName[0]) {
         throw new Error('DUPLICATE_PARTICIPANT');
       }
-      throw err;
+
+      if (phone) {
+        const cleanPhone = phone.replace(/\s+/g, '');
+        const allParticipants = await tx
+          .select({ id: participants.id, phone: participants.phone })
+          .from(participants);
+        const phoneMatch = allParticipants.find(
+          (p) => p.phone && p.phone.replace(/\s+/g, '') === cleanPhone
+        );
+        if (phoneMatch) {
+          throw new Error('DUPLICATE_PHONE');
+        }
+      }
+
+      const now = new Date().toISOString();
+      const id = `p_${crypto.randomBytes(8).toString('hex')}`;
+
+      try {
+        await tx.insert(participants).values({
+          id,
+          firstName,
+          lastName,
+          nickname,
+          phone,
+          avatarUrl,
+          score: 0,
+          status: 'ACTIVE',
+          scoreUpdatedAt: now,
+          createdAt: now,
+          normalizedKey,
+        });
+      } catch (insertErr) {
+        if (isPgUniqueViolation(insertErr)) {
+          throw new Error('DUPLICATE_PARTICIPANT');
+        }
+        throw insertErr;
+      }
+
+      const ranked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const created = ranked.find((p) => p.id === id);
+      if (!created) throw new Error('CREATE_FAILED');
+      return created;
+    });
+  } catch (error) {
+    if (error instanceof Error && [
+      'REGISTRATIONS_CLOSED',
+      'PHONE_REQUIRED',
+      'INVALID_NAME',
+      'INVALID_AVATAR',
+      'DUPLICATE_PARTICIPANT',
+      'DUPLICATE_PHONE',
+      'CREATE_FAILED',
+    ].includes(error.message)) {
+      throw error;
     }
-
-    const ranked = getRankedParticipants();
-    const created = ranked.find((p) => p.id === id);
-    if (!created) throw new Error('CREATE_FAILED');
-    return created;
-  });
-
-  try {
-    return withSqliteRetry(() => tx.immediate());
-  } catch (err) {
-    if (isUniqueConstraintError(err)) {
+    if (isPgUniqueViolation(error)) {
       throw new Error('DUPLICATE_PARTICIPANT');
     }
-    throw err;
+    console.error('Database query failed in createParticipant:', error);
+    throw new Error("Erreur lors de l'enregistrement du participant.", { cause: error });
   }
 }
 
-export function updateParticipantDetails(
+export async function updateParticipantDetails(
   id: string,
   updates: Partial<{
     first_name: string;
@@ -567,268 +390,342 @@ export function updateParticipantDetails(
     avatar_url: string | null;
     status: ParticipantStatus;
   }>
-): RankedParticipant {
-  initDatabase();
-  const existingRow = db.prepare('SELECT * FROM participants WHERE id = ?').get(id) as
-    | Record<string, unknown>
-    | undefined;
-  if (!existingRow) throw new Error('NOT_FOUND');
-
-  const firstName = (updates.first_name ?? String(existingRow.first_name)).trim();
-  const lastName = (updates.last_name ?? String(existingRow.last_name)).trim();
-  if (firstName.length < 2 || lastName.length < 2) {
-    throw new Error('INVALID_NAME');
+): Promise<RankedParticipant> {
+  if (isSupabaseConfigured()) {
+    return updateSupabaseParticipantDetails(id, updates);
   }
+  try {
+    return await db.transaction(async (tx) => {
+      const existingRows = await tx
+        .select()
+        .from(participants)
+        .where(eq(participants.id, id))
+        .limit(1);
+      const existingRow = existingRows[0];
+      if (!existingRow) throw new Error('NOT_FOUND');
 
-  const normalizedKey = normalizeParticipantKey(firstName, lastName);
-  const dup = db
-    .prepare('SELECT id FROM participants WHERE normalized_key = ? AND id != ?')
-    .get(normalizedKey, id);
-  if (dup) throw new Error('DUPLICATE_PARTICIPANT');
+      const firstName = (updates.first_name ?? existingRow.firstName).trim();
+      const lastName = (updates.last_name ?? existingRow.lastName).trim();
+      if (firstName.length < 2 || lastName.length < 2) {
+        throw new Error('INVALID_NAME');
+      }
 
-  const nickname =
-    updates.nickname !== undefined
-      ? updates.nickname?.trim() || null
-      : (existingRow.nickname as string | null);
-  const phone =
-    updates.phone !== undefined
-      ? updates.phone?.trim() || null
-      : (existingRow.phone as string | null);
-  const avatarUrl =
-    updates.avatar_url !== undefined
-      ? updates.avatar_url?.trim() || null
-      : (existingRow.avatar_url as string | null);
-  const status = updates.status ?? (existingRow.status as ParticipantStatus);
+      const normalizedKey = normalizeParticipantKey(firstName, lastName);
+      const dup = await tx
+        .select({ id: participants.id })
+        .from(participants)
+        .where(and(eq(participants.normalizedKey, normalizedKey), ne(participants.id, id)))
+        .limit(1);
+      if (dup[0]) throw new Error('DUPLICATE_PARTICIPANT');
 
-  db.prepare(`
-    UPDATE participants
-    SET first_name = ?, last_name = ?, nickname = ?, phone = ?, avatar_url = ?, status = ?, normalized_key = ?
-    WHERE id = ?
-  `).run(firstName, lastName, nickname, phone, avatarUrl, status, normalizedKey, id);
+      const nickname =
+        updates.nickname !== undefined ? updates.nickname?.trim() || null : existingRow.nickname;
+      const phone = updates.phone !== undefined ? updates.phone?.trim() || null : existingRow.phone;
+      const avatarUrl =
+        updates.avatar_url !== undefined
+          ? sanitizeAvatarUrl(updates.avatar_url)
+          : existingRow.avatarUrl;
+      const status = updates.status ?? (existingRow.status as ParticipantStatus);
 
-  const updated = getRankedParticipants().find((p) => p.id === id);
-  if (!updated) throw new Error('NOT_FOUND');
-  return updated;
+      await tx
+        .update(participants)
+        .set({
+          firstName,
+          lastName,
+          nickname,
+          phone,
+          avatarUrl,
+          status,
+          normalizedKey,
+        })
+        .where(eq(participants.id, id));
+
+      const updated = (await getRankedParticipantsWithExecutor(tx)).find((p) => p.id === id);
+      if (!updated) throw new Error('NOT_FOUND');
+      return updated;
+    });
+  } catch (error) {
+    if (error instanceof Error && [
+      'NOT_FOUND',
+      'INVALID_NAME',
+      'INVALID_AVATAR',
+      'DUPLICATE_PARTICIPANT',
+    ].includes(error.message)) {
+      throw error;
+    }
+    if (isPgUniqueViolation(error)) {
+      throw new Error('DUPLICATE_PARTICIPANT');
+    }
+    console.error('Database query failed in updateParticipantDetails:', error);
+    throw new Error('Impossible de mettre à jour le participant.', { cause: error });
+  }
 }
 
-export function deleteParticipant(id: string): void {
-  initDatabase();
-  const res = db.prepare('DELETE FROM participants WHERE id = ?').run(id);
-  if (res.changes === 0) throw new Error('NOT_FOUND');
+export async function deleteParticipant(id: string): Promise<void> {
+  if (isSupabaseConfigured()) {
+    return deleteSupabaseParticipant(id);
+  }
+  try {
+    const deleted = await db
+      .delete(participants)
+      .where(eq(participants.id, id))
+      .returning({ id: participants.id });
+    if (deleted.length === 0) throw new Error('NOT_FOUND');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'NOT_FOUND') {
+      throw error;
+    }
+    console.error('Database query failed in deleteParticipant:', error);
+    throw new Error('Impossible de supprimer le participant.', { cause: error });
+  }
 }
 
-export function applyScoreMutation(
+export async function applyScoreMutation(
   participantId: string,
   delta: number,
   reason: ScoreReason,
   adminName: string
-): {
+): Promise<{
   event: ScoreEvent;
   participants: RankedParticipant[];
   previousLeaderId: string | null;
   newLeaderId: string | null;
-} {
-  initDatabase();
+}> {
+  if (isSupabaseConfigured()) {
+    return applySupabaseScoreMutation(participantId, delta, reason, adminName);
+  }
   if (!Number.isFinite(delta) || delta === 0) {
     throw new Error('INVALID_DELTA');
   }
 
-  const tx = db.transaction(() => {
-    const comp = getCompetition();
-    const beforeRanked = getRankedParticipants();
-    const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
+  try {
+    return await db.transaction(async (tx) => {
+      const comp = await ensureCompetitionRow(tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
-    const pRow = db
-      .prepare('SELECT * FROM participants WHERE id = ?')
-      .get(participantId) as Record<string, unknown> | undefined;
-    if (!pRow) throw new Error('NOT_FOUND');
-    if (pRow.status === 'DISQUALIFIED') {
-      throw new Error('PARTICIPANT_DISQUALIFIED');
+      const pRows = await tx
+        .select()
+        .from(participants)
+        .where(eq(participants.id, participantId))
+        .limit(1);
+      const pRow = pRows[0];
+      if (!pRow) throw new Error('NOT_FOUND');
+      if (pRow.status === 'DISQUALIFIED') {
+        throw new Error('PARTICIPANT_DISQUALIFIED');
+      }
+
+      const previousScore = pRow.score;
+      const truncatedDelta = Math.trunc(delta);
+      const newScore = previousScore + truncatedDelta;
+      const now = new Date().toISOString();
+      const participantName = `${pRow.firstName} ${pRow.lastName}`.trim();
+      const eventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
+
+      await tx
+        .update(participants)
+        .set({ score: newScore, scoreUpdatedAt: now })
+        .where(eq(participants.id, participantId));
+
+      const insertedEvents = await tx
+        .insert(scoreEvents)
+        .values({
+          id: eventId,
+          participantId,
+          participantName,
+          delta: truncatedDelta,
+          previousScore,
+          newScore,
+          reason,
+          roundNumber: comp.current_round,
+          adminName,
+          reverted: false,
+          createdAt: now,
+        })
+        .returning();
+
+      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
+
+      return {
+        event: mapEventRow(insertedEvents[0]),
+        participants: afterRanked,
+        previousLeaderId,
+        newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
+      };
+    });
+  } catch (error) {
+    if (error instanceof Error && [
+      'INVALID_DELTA',
+      'NOT_FOUND',
+      'PARTICIPANT_DISQUALIFIED',
+    ].includes(error.message)) {
+      throw error;
     }
-
-    const previousScore = Number(pRow.score);
-    const newScore = previousScore + Math.trunc(delta);
-    const now = new Date().toISOString();
-    const participantName = `${pRow.first_name} ${pRow.last_name}`.trim();
-    const eventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
-
-    db.prepare('UPDATE participants SET score = ?, score_updated_at = ? WHERE id = ?').run(
-      newScore,
-      now,
-      participantId
-    );
-
-    db.prepare(`
-      INSERT INTO score_events (
-        id, participant_id, participant_name, delta, previous_score, new_score,
-        reason, round_number, admin_name, reverted, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-    `).run(
-      eventId,
-      participantId,
-      participantName,
-      Math.trunc(delta),
-      previousScore,
-      newScore,
-      reason,
-      comp.current_round,
-      adminName,
-      now
-    );
-
-    const afterRanked = getRankedParticipants();
-    const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
-    const eventRow = db.prepare('SELECT * FROM score_events WHERE id = ?').get(eventId) as Record<
-      string,
-      unknown
-    >;
-
-    return {
-      event: mapEventRow(eventRow),
-      participants: afterRanked,
-      previousLeaderId,
-      newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
-    };
-  });
-
-  return tx();
+    console.error('Database query failed in applyScoreMutation:', error);
+    throw new Error('Impossible de mettre à jour le score.', { cause: error });
+  }
 }
 
-export function resetSingleParticipantScore(
+export async function resetSingleParticipantScore(
   participantId: string,
   adminName: string
-): {
+): Promise<{
   event: ScoreEvent;
   participants: RankedParticipant[];
   previousLeaderId: string | null;
   newLeaderId: string | null;
-} {
-  initDatabase();
-  const tx = db.transaction(() => {
-    const comp = getCompetition();
-    const beforeRanked = getRankedParticipants();
-    const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
+}> {
+  if (isSupabaseConfigured()) {
+    return resetSupabaseSingleParticipantScore(participantId, adminName);
+  }
+  try {
+    return await db.transaction(async (tx) => {
+      const comp = await ensureCompetitionRow(tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
-    const pRow = db
-      .prepare('SELECT * FROM participants WHERE id = ?')
-      .get(participantId) as Record<string, unknown> | undefined;
-    if (!pRow) throw new Error('NOT_FOUND');
+      const pRows = await tx
+        .select()
+        .from(participants)
+        .where(eq(participants.id, participantId))
+        .limit(1);
+      const pRow = pRows[0];
+      if (!pRow) throw new Error('NOT_FOUND');
 
-    const previousScore = Number(pRow.score);
-    const delta = -previousScore;
-    const now = new Date().toISOString();
-    const eventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
-    const participantName = `${pRow.first_name} ${pRow.last_name}`.trim();
+      const previousScore = pRow.score;
+      const delta = -previousScore;
+      const now = new Date().toISOString();
+      const eventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
+      const participantName = `${pRow.firstName} ${pRow.lastName}`.trim();
 
-    db.prepare('UPDATE participants SET score = 0, score_updated_at = ? WHERE id = ?').run(
-      now,
-      participantId
-    );
+      await tx
+        .update(participants)
+        .set({ score: 0, scoreUpdatedAt: now })
+        .where(eq(participants.id, participantId));
 
-    db.prepare(`
-      INSERT INTO score_events (
-        id, participant_id, participant_name, delta, previous_score, new_score,
-        reason, round_number, admin_name, reverted, created_at
-      ) VALUES (?, ?, ?, ?, ?, 0, 'RESET', ?, ?, 0, ?)
-    `).run(eventId, participantId, participantName, delta, previousScore, comp.current_round, adminName, now);
+      const insertedEvents = await tx
+        .insert(scoreEvents)
+        .values({
+          id: eventId,
+          participantId,
+          participantName,
+          delta,
+          previousScore,
+          newScore: 0,
+          reason: 'RESET',
+          roundNumber: comp.current_round,
+          adminName,
+          reverted: false,
+          createdAt: now,
+        })
+        .returning();
 
-    const afterRanked = getRankedParticipants();
-    const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
-    const eventRow = db.prepare('SELECT * FROM score_events WHERE id = ?').get(eventId) as Record<
-      string,
-      unknown
-    >;
+      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
 
-    return {
-      event: mapEventRow(eventRow),
-      participants: afterRanked,
-      previousLeaderId,
-      newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
-    };
-  });
-
-  return tx();
+      return {
+        event: mapEventRow(insertedEvents[0]),
+        participants: afterRanked,
+        previousLeaderId,
+        newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
+      };
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'NOT_FOUND') {
+      throw error;
+    }
+    console.error('Database query failed in resetSingleParticipantScore:', error);
+    throw new Error('Impossible de réinitialiser le score.', { cause: error });
+  }
 }
 
-export function undoLastScoreOperation(adminName: string): {
+export async function undoLastScoreOperation(adminName: string): Promise<{
   event: ScoreEvent;
   participants: RankedParticipant[];
   previousLeaderId: string | null;
   newLeaderId: string | null;
-} {
-  initDatabase();
-  const tx = db.transaction(() => {
-    const comp = getCompetition();
-    const beforeRanked = getRankedParticipants();
-    const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
+}> {
+  if (isSupabaseConfigured()) {
+    return undoSupabaseLastScoreOperation(adminName);
+  }
+  try {
+    return await db.transaction(async (tx) => {
+      const comp = await ensureCompetitionRow(tx);
+      const beforeRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const previousLeaderId = beforeRanked.find((p) => p.isLeader)?.id ?? null;
 
-    const lastEvent = db
-      .prepare(`
-        SELECT * FROM score_events
-        WHERE reverted = 0 AND reason != 'UNDO'
-        ORDER BY created_at DESC
-        LIMIT 1
-      `)
-      .get() as Record<string, unknown> | undefined;
+      const lastEvents = await tx
+        .select()
+        .from(scoreEvents)
+        .where(and(eq(scoreEvents.reverted, false), ne(scoreEvents.reason, 'UNDO')))
+        .orderBy(desc(scoreEvents.createdAt))
+        .limit(1);
 
-    if (!lastEvent) throw new Error('NOTHING_TO_UNDO');
+      const lastEvent = lastEvents[0];
+      if (!lastEvent) throw new Error('NOTHING_TO_UNDO');
 
-    const participantId = String(lastEvent.participant_id);
-    const pRow = db
-      .prepare('SELECT * FROM participants WHERE id = ?')
-      .get(participantId) as Record<string, unknown> | undefined;
+      const pRows = await tx
+        .select()
+        .from(participants)
+        .where(eq(participants.id, lastEvent.participantId))
+        .limit(1);
+      const pRow = pRows[0];
+      if (!pRow) throw new Error('PARTICIPANT_NOT_FOUND');
 
-    if (!pRow) throw new Error('PARTICIPANT_NOT_FOUND');
+      const currentScore = pRow.score;
+      const targetScore = lastEvent.previousScore;
+      const undoDelta = targetScore - currentScore;
+      const now = new Date().toISOString();
+      const undoEventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
 
-    const currentScore = Number(pRow.score);
-    const targetScore = Number(lastEvent.previous_score);
-    const undoDelta = targetScore - currentScore;
-    const now = new Date().toISOString();
-    const undoEventId = `evt_${crypto.randomBytes(6).toString('hex')}`;
+      await tx
+        .update(scoreEvents)
+        .set({ reverted: true })
+        .where(eq(scoreEvents.id, lastEvent.id));
 
-    db.prepare('UPDATE score_events SET reverted = 1 WHERE id = ?').run(String(lastEvent.id));
-    db.prepare('UPDATE participants SET score = ?, score_updated_at = ? WHERE id = ?').run(
-      targetScore,
-      now,
-      participantId
-    );
+      await tx
+        .update(participants)
+        .set({ score: targetScore, scoreUpdatedAt: now })
+        .where(eq(participants.id, lastEvent.participantId));
 
-    db.prepare(`
-      INSERT INTO score_events (
-        id, participant_id, participant_name, delta, previous_score, new_score,
-        reason, round_number, admin_name, reverted, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'UNDO', ?, ?, 0, ?)
-    `).run(
-      undoEventId,
-      participantId,
-      String(lastEvent.participant_name),
-      undoDelta,
-      currentScore,
-      targetScore,
-      comp.current_round,
-      adminName,
-      now
-    );
+      const insertedEvents = await tx
+        .insert(scoreEvents)
+        .values({
+          id: undoEventId,
+          participantId: lastEvent.participantId,
+          participantName: lastEvent.participantName,
+          delta: undoDelta,
+          previousScore: currentScore,
+          newScore: targetScore,
+          reason: 'UNDO',
+          roundNumber: comp.current_round,
+          adminName,
+          reverted: false,
+          createdAt: now,
+        })
+        .returning();
 
-    const afterRanked = getRankedParticipants();
-    const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
-    const eventRow = db.prepare('SELECT * FROM score_events WHERE id = ?').get(undoEventId) as Record<
-      string,
-      unknown
-    >;
+      const afterRanked = await getRankedParticipantsWithExecutor(tx, comp.tie_breaker);
+      const newLeaderId = afterRanked.find((p) => p.isLeader)?.id ?? null;
 
-    return {
-      event: mapEventRow(eventRow),
-      participants: afterRanked,
-      previousLeaderId,
-      newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
-    };
-  });
-
-  return tx();
+      return {
+        event: mapEventRow(insertedEvents[0]),
+        participants: afterRanked,
+        previousLeaderId,
+        newLeaderId: newLeaderId !== previousLeaderId ? newLeaderId : null,
+      };
+    });
+  } catch (error) {
+    if (error instanceof Error && ['NOTHING_TO_UNDO', 'PARTICIPANT_NOT_FOUND'].includes(error.message)) {
+      throw error;
+    }
+    console.error('Database query failed in undoLastScoreOperation:', error);
+    throw new Error("Impossible d'annuler l'opération.", { cause: error });
+  }
 }
 
-export function updateCompetitionConfig(
+export async function updateCompetitionConfig(
   updates: Partial<{
     name: string;
     subtitle: string;
@@ -846,135 +743,135 @@ export function updateCompetitionConfig(
     question_timer_seconds: number;
     question_timer_action: 'START' | 'PAUSE' | 'RESET';
   }>
-): Competition {
-  initDatabase();
-  const tx = db.transaction(() => {
-    const current = getCompetition();
-    const nowMs = Date.now();
-    const nowIso = new Date(nowMs).toISOString();
+): Promise<Competition> {
+  if (isSupabaseConfigured()) {
+    return updateSupabaseCompetitionConfig(updates);
+  }
+  try {
+    return await db.transaction(async (tx) => {
+      const current = await ensureCompetitionRow(tx);
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
 
-    let nextStatus = updates.status ?? current.status;
-    let elapsedSeconds = current.elapsed_seconds;
-    let resumedAt = current.resumed_at;
-    let startedAt = current.started_at;
+      const nextStatus = updates.status ?? current.status;
+      let elapsedSeconds = current.elapsed_seconds;
+      let resumedAt = current.resumed_at;
+      let startedAt = current.started_at;
 
-    if (updates.status && updates.status !== current.status) {
-      if (current.status === 'LIVE' && current.resumed_at) {
-        const segmentSec = Math.max(0, Math.floor((nowMs - Date.parse(current.resumed_at)) / 1000));
-        elapsedSeconds += segmentSec;
+      if (updates.status && updates.status !== current.status) {
+        if (current.status === 'LIVE' && current.resumed_at) {
+          const segmentSec = Math.max(0, Math.floor((nowMs - Date.parse(current.resumed_at)) / 1000));
+          elapsedSeconds += segmentSec;
+        }
+
+        if (nextStatus === 'LIVE') {
+          if (!startedAt) startedAt = nowIso;
+          resumedAt = nowIso;
+        } else {
+          resumedAt = null;
+        }
+
+        if (nextStatus === 'PREPARATION') {
+          elapsedSeconds = 0;
+          startedAt = null;
+          resumedAt = null;
+        }
       }
 
-      if (nextStatus === 'LIVE') {
-        if (!startedAt) startedAt = nowIso;
-        resumedAt = nowIso;
-      } else {
-        resumedAt = null;
+      let qTimerRunning = current.question_timer_running;
+      let qTimerStartedAt = current.question_timer_started_at;
+      const qTimerSeconds = updates.question_timer_seconds ?? current.question_timer_seconds;
+
+      if (updates.question_timer_action === 'START') {
+        qTimerRunning = true;
+        qTimerStartedAt = nowIso;
+      } else if (updates.question_timer_action === 'PAUSE') {
+        qTimerRunning = false;
+        qTimerStartedAt = null;
+      } else if (updates.question_timer_action === 'RESET') {
+        qTimerRunning = false;
+        qTimerStartedAt = null;
       }
 
-      if (nextStatus === 'PREPARATION') {
-        elapsedSeconds = 0;
-        startedAt = null;
-        resumedAt = null;
-      }
-    }
+      const updatedRows = await tx
+        .update(competitions)
+        .set({
+          name: (updates.name ?? current.name).trim() || current.name,
+          subtitle: (updates.subtitle ?? current.subtitle).trim(),
+          status: nextStatus,
+          registrationsOpen: updates.registrations_open ?? current.registrations_open,
+          requirePhone: updates.require_phone ?? current.require_phone,
+          confirmLargeDelta: updates.confirm_large_delta ?? current.confirm_large_delta,
+          largeDeltaThreshold: Math.max(
+            1,
+            Math.trunc(updates.large_delta_threshold ?? current.large_delta_threshold)
+          ),
+          tieBreaker: updates.tie_breaker ?? current.tie_breaker,
+          pointsCorrect: Math.trunc(updates.points_correct ?? current.points_correct),
+          pointsWrong: Math.trunc(updates.points_wrong ?? current.points_wrong),
+          pointsBonus: Math.trunc(updates.points_bonus ?? current.points_bonus),
+          currentRound: Math.max(1, Math.trunc(updates.current_round ?? current.current_round)),
+          roundTitle: (updates.round_title ?? current.round_title).trim() || current.round_title,
+          startedAt,
+          elapsedSeconds,
+          resumedAt,
+          questionTimerSeconds: Math.max(5, Math.trunc(qTimerSeconds)),
+          questionTimerRunning: qTimerRunning,
+          questionTimerStartedAt: qTimerStartedAt,
+        })
+        .where(eq(competitions.id, 'main'))
+        .returning();
 
-    let qTimerRunning = current.question_timer_running;
-    let qTimerStartedAt = current.question_timer_started_at;
-    let qTimerSeconds = updates.question_timer_seconds ?? current.question_timer_seconds;
-
-    if (updates.question_timer_action === 'START') {
-      qTimerRunning = true;
-      qTimerStartedAt = nowIso;
-    } else if (updates.question_timer_action === 'PAUSE') {
-      qTimerRunning = false;
-      qTimerStartedAt = null;
-    } else if (updates.question_timer_action === 'RESET') {
-      qTimerRunning = false;
-      qTimerStartedAt = null;
-    }
-
-    db.prepare(`
-      UPDATE competitions SET
-        name = ?,
-        subtitle = ?,
-        status = ?,
-        registrations_open = ?,
-        require_phone = ?,
-        confirm_large_delta = ?,
-        large_delta_threshold = ?,
-        tie_breaker = ?,
-        points_correct = ?,
-        points_wrong = ?,
-        points_bonus = ?,
-        current_round = ?,
-        round_title = ?,
-        started_at = ?,
-        elapsed_seconds = ?,
-        resumed_at = ?,
-        question_timer_seconds = ?,
-        question_timer_running = ?,
-        question_timer_started_at = ?
-      WHERE id = 'main'
-    `).run(
-      (updates.name ?? current.name).trim() || current.name,
-      (updates.subtitle ?? current.subtitle).trim(),
-      nextStatus,
-      (updates.registrations_open ?? current.registrations_open) ? 1 : 0,
-      (updates.require_phone ?? current.require_phone) ? 1 : 0,
-      (updates.confirm_large_delta ?? current.confirm_large_delta) ? 1 : 0,
-      Math.max(1, Math.trunc(updates.large_delta_threshold ?? current.large_delta_threshold)),
-      updates.tie_breaker ?? current.tie_breaker,
-      Math.trunc(updates.points_correct ?? current.points_correct),
-      Math.trunc(updates.points_wrong ?? current.points_wrong),
-      Math.trunc(updates.points_bonus ?? current.points_bonus),
-      Math.max(1, Math.trunc(updates.current_round ?? current.current_round)),
-      (updates.round_title ?? current.round_title).trim() || current.round_title,
-      startedAt,
-      elapsedSeconds,
-      resumedAt,
-      Math.max(5, Math.trunc(qTimerSeconds)),
-      qTimerRunning ? 1 : 0,
-      qTimerStartedAt
-    );
-
-    return getCompetition();
-  });
-
-  return tx();
+      return mapCompetitionRow(updatedRows[0]);
+    });
+  } catch (error) {
+    console.error('Database query failed in updateCompetitionConfig:', error);
+    throw new Error('Impossible de mettre à jour la compétition.', { cause: error });
+  }
 }
 
-export function resetCompetitionData(mode: 'scores' | 'full'): void {
-  initDatabase();
+export async function resetCompetitionData(mode: 'scores' | 'full'): Promise<void> {
+  if (isSupabaseConfigured()) {
+    return resetSupabaseCompetitionData(mode);
+  }
   const now = new Date().toISOString();
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM score_events').run();
-    if (mode === 'full') {
-      db.prepare('DELETE FROM participants').run();
-      db.prepare(`
-        UPDATE competitions SET
-          status = 'PREPARATION',
-          current_round = 1,
-          round_title = 'Manche 1',
-          started_at = NULL,
-          elapsed_seconds = 0,
-          resumed_at = NULL,
-          question_timer_running = 0,
-          question_timer_started_at = NULL
-        WHERE id = 'main'
-      `).run();
-    } else {
-      db.prepare(`UPDATE participants SET score = 0, score_updated_at = ?`).run(now);
-      db.prepare(`
-        UPDATE competitions SET
-          status = 'PREPARATION',
-          elapsed_seconds = 0,
-          started_at = NULL,
-          resumed_at = NULL,
-          question_timer_running = 0,
-          question_timer_started_at = NULL
-        WHERE id = 'main'
-      `).run();
-    }
-  });
-  tx();
+  try {
+    await db.transaction(async (tx) => {
+      await ensureCompetitionRow(tx);
+      await tx.delete(scoreEvents);
+
+      if (mode === 'full') {
+        await tx.delete(participants);
+        await tx
+          .update(competitions)
+          .set({
+            status: 'PREPARATION',
+            currentRound: 1,
+            roundTitle: 'Manche 1',
+            startedAt: null,
+            elapsedSeconds: 0,
+            resumedAt: null,
+            questionTimerRunning: false,
+            questionTimerStartedAt: null,
+          })
+          .where(eq(competitions.id, 'main'));
+      } else {
+        await tx.update(participants).set({ score: 0, scoreUpdatedAt: now });
+        await tx
+          .update(competitions)
+          .set({
+            status: 'PREPARATION',
+            elapsedSeconds: 0,
+            startedAt: null,
+            resumedAt: null,
+            questionTimerRunning: false,
+            questionTimerStartedAt: null,
+          })
+          .where(eq(competitions.id, 'main'));
+      }
+    });
+  } catch (error) {
+    console.error('Database query failed in resetCompetitionData:', error);
+    throw new Error('Impossible de réinitialiser la compétition.', { cause: error });
+  }
 }

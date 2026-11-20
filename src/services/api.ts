@@ -1,3 +1,4 @@
+import { auth } from '../lib/firebase.ts';
 import type {
   AdminUser,
   Competition,
@@ -6,28 +7,21 @@ import type {
   RankedParticipant,
   ScoreEvent,
   ScoreReason,
-} from '../types/quiz';
+} from '../types/quiz.ts';
 
-const TOKEN_KEY = 'qcl_admin_token';
+let inMemoryIdToken: string | null = null;
 
-export function getStoredAdminToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
+export function setInMemoryAuthToken(token: string | null): void {
+  inMemoryIdToken = token;
 }
 
-export function setStoredAdminToken(token: string | null): void {
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
-    }
-  } catch {
-    // ignore storage errors
+async function resolveAuthToken(): Promise<string | null> {
+  if (auth.currentUser) {
+    const freshToken = await auth.currentUser.getIdToken();
+    inMemoryIdToken = freshToken;
+    return freshToken;
   }
+  return inMemoryIdToken;
 }
 
 async function requestJson<T>(url: string, init: RequestInit = {}, withAuth = false): Promise<T> {
@@ -36,7 +30,7 @@ async function requestJson<T>(url: string, init: RequestInit = {}, withAuth = fa
     headers.set('Content-Type', 'application/json');
   }
   if (withAuth) {
-    const token = getStoredAdminToken();
+    const token = await resolveAuthToken();
     if (token) {
       headers.set('Authorization', `Bearer ${token}`);
     }
@@ -46,7 +40,7 @@ async function requestJson<T>(url: string, init: RequestInit = {}, withAuth = fa
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     if (res.status === 413) {
-      throw new Error("La photo envoyée est trop volumineuse.");
+      throw new Error('La photo envoyée est trop volumineuse.');
     }
     throw new Error(
       typeof data?.error === 'string'
@@ -82,15 +76,7 @@ export const quizApi = {
       body: JSON.stringify(payload),
     }),
 
-  adminLogin: (email: string, passcode: string) =>
-    requestJson<{ token: string; admin: AdminUser }>('/api/admin/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, passcode }),
-    }),
-
   adminMe: () => requestJson<{ admin: AdminUser }>('/api/admin/me', {}, true),
-
-  adminLogout: () => requestJson<{ ok: boolean }>('/api/admin/logout', { method: 'POST' }, true),
 
   adminAddParticipant: (payload: {
     first_name: string;

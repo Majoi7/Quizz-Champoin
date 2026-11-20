@@ -1,22 +1,15 @@
+import 'dotenv/config';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-
-const tempDbPath = path.join(
-  os.tmpdir(),
-  `qcl-reg-test-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
-);
-process.env.SQLITE_PATH = tempDbPath;
-
-const { createApiApp } = await import('./app');
-const { db } = await import('./db');
+import { createApiApp } from './app.ts';
+import { deleteParticipant } from './db.ts';
 
 let server: http.Server;
 let baseUrl = '';
 let shouldThrowBroadcast = false;
+const createdIds: string[] = [];
+const runSuffix = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
 test.before(async () => {
   const app = createApiApp({
@@ -39,32 +32,32 @@ test.before(async () => {
 });
 
 test.after(async () => {
+  for (const id of createdIds) {
+    try {
+      await deleteParticipant(id);
+    } catch {
+      // ignore if already removed
+    }
+  }
   await new Promise<void>((resolve) => {
     if (!server) return resolve();
     server.close(() => resolve());
   });
-  try {
-    db.close();
-  } catch {
-    // ignore
-  }
-  for (const suffix of ['', '-wal', '-shm']) {
-    const filePath = `${tempDbPath}${suffix}`;
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
+  if (global._postgresPool) {
+    await global._postgresPool.end().catch(() => undefined);
+    global._postgresPool = undefined;
   }
 });
 
-test('POST /api/register creates participant with score 0 and status ACTIVE', async () => {
+test('POST /api/register persists participant in PostgreSQL with score 0 and status ACTIVE', async () => {
   const res = await fetch(`${baseUrl}/api/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      first_name: 'Camille',
+      first_name: `Camille_${runSuffix}`,
       last_name: 'Diallo',
       nickname: 'La Foudre',
-      phone: '+33 6 11 22 33 44',
+      phone: `+336${runSuffix.slice(0, 8)}`,
     }),
   });
 
@@ -78,8 +71,9 @@ test('POST /api/register creates participant with score 0 and status ACTIVE', as
       status: string;
     };
   };
+  createdIds.push(data.participant.id);
   assert.ok(data.participant.id.startsWith('p_'));
-  assert.equal(data.participant.first_name, 'Camille');
+  assert.equal(data.participant.first_name, `Camille_${runSuffix}`);
   assert.equal(data.participant.last_name, 'Diallo');
   assert.equal(data.participant.score, 0);
   assert.equal(data.participant.status, 'ACTIVE');
@@ -87,7 +81,7 @@ test('POST /api/register creates participant with score 0 and status ACTIVE', as
 
 test('POST /api/register handles concurrent duplicate registrations with 409 (never 500)', async () => {
   const payload = JSON.stringify({
-    first_name: 'Nadia',
+    first_name: `Nadia_${runSuffix}`,
     last_name: 'Benali',
   });
 
@@ -109,6 +103,13 @@ test('POST /api/register handles concurrent duplicate registrations with 409 (ne
     }),
   ]);
 
+  for (const r of [r1, r2, r3]) {
+    if (r.status === 201) {
+      const json = (await r.json()) as { participant?: { id?: string } };
+      if (json.participant?.id) createdIds.push(json.participant.id);
+    }
+  }
+
   const statuses = [r1.status, r2.status, r3.status].sort();
   assert.deepEqual(statuses, [201, 409, 409]);
 });
@@ -118,9 +119,9 @@ test('POST /api/register rejects duplicate phone with 409', async () => {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      first_name: 'Thomas',
+      first_name: `Thomas_${runSuffix}`,
       last_name: 'Leroy',
-      phone: '+33611223344',
+      phone: `+336${runSuffix.slice(0, 8)}`,
     }),
   });
 
@@ -147,7 +148,7 @@ test('POST /api/register rejects invalid or oversized avatar_url with 400', asyn
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      first_name: 'Luc',
+      first_name: `Luc_${runSuffix}`,
       last_name: 'Morel',
       avatar_url: 'javascript:alert(1)',
     }),
@@ -158,7 +159,7 @@ test('POST /api/register rejects invalid or oversized avatar_url with 400', asyn
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      first_name: 'Luc',
+      first_name: `Luc_${runSuffix}`,
       last_name: 'Morel',
       avatar_url: `data:image/png;base64,${'a'.repeat(460_000)}`,
     }),
@@ -173,12 +174,14 @@ test('POST /api/register succeeds with 201 even when WebSocket broadcast throws'
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        first_name: 'Ines',
+        first_name: `Ines_${runSuffix}`,
         last_name: 'Kone',
         avatar_url: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
       }),
     });
     assert.equal(res.status, 201);
+    const json = (await res.json()) as { participant?: { id?: string } };
+    if (json.participant?.id) createdIds.push(json.participant.id);
   } finally {
     shouldThrowBroadcast = false;
   }
@@ -208,8 +211,13 @@ test('POST /api/register returns clean JSON 400/413 for malformed or oversized J
   assert.ok(tooBigBody.error.length > 0);
 });
 
+test('GET /api/admin/me rejects unauthenticated requests with 401', async () => {
+  const res = await fetch(`${baseUrl}/api/admin/me`);
+  assert.equal(res.status, 401);
+});
+
 test('api/index serverless handler handles pre-parsed body without 500', async () => {
-  const { default: handler } = await import('../api/index');
+  const { default: handler } = await import('../api/index.ts');
   let statusCode = 200;
   let jsonBody: unknown = null;
 
@@ -218,7 +226,7 @@ test('api/index serverless handler handles pre-parsed body without 500', async (
     url: '/api/register',
     headers: { 'content-type': 'application/json' },
     body: {
-      first_name: 'Samba',
+      first_name: `Samba_${runSuffix}`,
       last_name: 'Traore',
     },
   } as unknown as Parameters<typeof handler>[0];
@@ -251,5 +259,7 @@ test('api/index serverless handler handles pre-parsed body without 500', async (
   });
 
   assert.equal(statusCode, 201);
-  assert.ok((jsonBody as { participant?: { id?: string } })?.participant?.id);
+  const participantId = (jsonBody as { participant?: { id?: string } })?.participant?.id;
+  assert.ok(participantId);
+  if (participantId) createdIds.push(participantId);
 });

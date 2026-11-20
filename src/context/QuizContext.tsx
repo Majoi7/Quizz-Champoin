@@ -1,6 +1,9 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { audioService } from '../lib/audioService';
-import { getStoredAdminToken, quizApi, setStoredAdminToken } from '../services/api';
+import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { audioService } from '../lib/audioService.ts';
+import { auth, googleAuthProvider } from '../lib/firebase.ts';
+import { getOrCreateSupabaseClient, supabaseClient } from '../lib/supabase.ts';
+import { quizApi, setInMemoryAuthToken } from '../services/api.ts';
 import type {
   AdminUser,
   Competition,
@@ -8,7 +11,7 @@ import type {
   RankedParticipant,
   ScoreEvent,
   ServerWsMessage,
-} from '../types/quiz';
+} from '../types/quiz.ts';
 
 export type WsConnectionStatus = 'connecting' | 'connected' | 'reconnecting';
 
@@ -30,7 +33,7 @@ interface QuizContextValue {
   adminAuthChecked: boolean;
   soundEnabled: boolean;
   toggleSound: () => void;
-  loginAdmin: (email: string, passcode: string) => Promise<AdminUser>;
+  loginWithGoogle: () => Promise<AdminUser>;
   logoutAdmin: () => Promise<void>;
   refreshState: () => Promise<void>;
 }
@@ -128,29 +131,88 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     window.addEventListener('pointerdown', handleGestureUnlock, { once: true, passive: true });
     window.addEventListener('keydown', handleGestureUnlock, { once: true, passive: true });
 
-    const token = getStoredAdminToken();
-    if (token) {
-      quizApi
-        .adminMe()
-        .then((res) => {
-          if (mountedRef.current) setAdmin(res.admin);
-        })
-        .catch(() => {
-          setStoredAdminToken(null);
-          if (mountedRef.current) setAdmin(null);
-        })
-        .finally(() => {
-          if (mountedRef.current) setAdminAuthChecked(true);
+    const unsubscribeAuth = onAuthStateChanged(auth, async (fbUser) => {
+      if (!mountedRef.current) return;
+      if (!fbUser) {
+        setInMemoryAuthToken(null);
+        setAdmin(null);
+        setAdminAuthChecked(true);
+        return;
+      }
+
+      try {
+        const token = await fbUser.getIdToken();
+        setInMemoryAuthToken(token);
+        const res = await quizApi.adminMe();
+        if (mountedRef.current) {
+          setAdmin(res.admin);
+        }
+      } catch {
+        setInMemoryAuthToken(null);
+        if (mountedRef.current) {
+          setAdmin(null);
+        }
+      } finally {
+        if (mountedRef.current) {
+          setAdminAuthChecked(true);
+        }
+      }
+    });
+
+    let activeSupabaseClient = supabaseClient;
+    let supabaseChannel: ReturnType<NonNullable<typeof supabaseClient>['channel']> | null = null;
+
+    const attachSupabaseRealtime = (client: NonNullable<typeof supabaseClient>) => {
+      if (!mountedRef.current || supabaseChannel) return;
+      activeSupabaseClient = client;
+      supabaseChannel = client
+        .channel('quiz-champion-live-sync')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'participants' },
+          () => {
+            void refreshState();
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'competitions' },
+          () => {
+            void refreshState();
+          }
+        )
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'score_events' },
+          () => {
+            void refreshState();
+          }
+        )
+        .subscribe((status) => {
+          if (mountedRef.current && status === 'SUBSCRIBED') {
+            setConnectionStatus('connected');
+          }
         });
+    };
+
+    if (activeSupabaseClient) {
+      attachSupabaseRealtime(activeSupabaseClient);
     } else {
-      setAdminAuthChecked(true);
+      fetch('/api/realtime-config')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((cfg: { supabaseUrl?: string | null; supabaseAnonKey?: string | null } | null) => {
+          if (!mountedRef.current || !cfg?.supabaseUrl || !cfg?.supabaseAnonKey) return;
+          const client = getOrCreateSupabaseClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
+          if (client) attachSupabaseRealtime(client);
+        })
+        .catch(() => undefined);
     }
 
     const startHttpPolling = () => {
       if (pollingTimerRef.current !== null || !mountedRef.current) return;
       pollingTimerRef.current = window.setInterval(() => {
         refreshState();
-      }, 1800);
+      }, 1500);
     };
 
     const connectWs = () => {
@@ -213,9 +275,10 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
         const attempt = reconnectAttemptRef.current;
         reconnectAttemptRef.current += 1;
 
-        // On serverless deployments (e.g. Vercel) WebSockets are unavailable: switch cleanly to HTTP sync
         if (!wsEverConnectedRef.current && attempt >= 1) {
-          startHttpPolling();
+          if (!supabaseChannel) {
+            startHttpPolling();
+          }
           setConnectionStatus('connected');
           return;
         }
@@ -236,6 +299,10 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       mountedRef.current = false;
+      unsubscribeAuth();
+      if (supabaseChannel && activeSupabaseClient) {
+        void activeSupabaseClient.removeChannel(supabaseChannel);
+      }
       window.removeEventListener('pointerdown', handleGestureUnlock);
       window.removeEventListener('keydown', handleGestureUnlock);
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
@@ -253,20 +320,22 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const loginAdmin = useCallback(async (email: string, passcode: string) => {
-    const res = await quizApi.adminLogin(email, passcode);
-    setStoredAdminToken(res.token);
+  const loginWithGoogle = useCallback(async () => {
+    const credential = await signInWithPopup(auth, googleAuthProvider);
+    const token = await credential.user.getIdToken();
+    setInMemoryAuthToken(token);
+    const res = await quizApi.adminMe();
     setAdmin(res.admin);
     return res.admin;
   }, []);
 
   const logoutAdmin = useCallback(async () => {
     try {
-      await quizApi.adminLogout();
+      await signOut(auth);
     } catch {
       // ignore
     }
-    setStoredAdminToken(null);
+    setInMemoryAuthToken(null);
     setAdmin(null);
   }, []);
 
@@ -284,7 +353,7 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
         adminAuthChecked,
         soundEnabled,
         toggleSound,
-        loginAdmin,
+        loginWithGoogle,
         logoutAdmin,
         refreshState,
       }}

@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import type express from 'express';
-import { createApiApp } from '../server/app';
+import { createApiApp } from '../server/app.ts';
 
 let cachedApp: express.Express | null = null;
 
@@ -12,7 +13,7 @@ export default function handler(req: express.Request, res: express.Response) {
   } catch (err) {
     console.error('[api/index] handler error:', err);
     return res.status(500).json({
-      error: "Service momentanément indisponible. Veuillez réessayer.",
+      error: 'Service momentanément indisponible. Veuillez réessayer.',
     });
   }
 }

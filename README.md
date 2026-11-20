@@ -1,6 +1,14 @@
 # QUIZ CHAMPION LIVE
 
-Plateforme de jeu télévisé de culture générale en temps réel (inscription publique, régie administrateur, écran Live et classement synchronisé avec effets sonores Web Audio API).
+Plateforme de jeu télévisé de culture générale en temps réel (inscription publique, régie administrateur sécurisée via Firebase Auth, écran Live et classement synchronisé avec **Supabase PostgreSQL + Supabase Realtime** et effets sonores Web Audio API).
+
+## Configuration Supabase (Recommandé pour Vercel & Temps Réel)
+
+1. Créez un projet sur [Supabase](https://supabase.com).
+2. Dans **SQL Editor → New query**, exécutez le script [`supabase/schema.sql`](./supabase/schema.sql) pour créer les tables (`competitions`, `participants`, `score_events`, `users`), les règles RLS de lecture publique et activer **Supabase Realtime**.
+3. Récupérez vos clés dans **Project Settings → API** et renseignez les variables d'environnement (`.env` en local ou **Settings → Environment Variables** sur Vercel) :
+   - `VITE_SUPABASE_URL` et `VITE_SUPABASE_ANON_KEY` (synchronisation **Supabase Realtime** côté navigateur)
+   - `SUPABASE_URL` et `SUPABASE_SERVICE_ROLE_KEY` (écriture sécurisée côté serveur `/api/register` et `/api/admin/*`)
 
 ## Démarrage en local
 
@@ -9,24 +17,12 @@ npm install
 npm run dev
 ```
 
-L'application démarre sur `http://localhost:3000` avec Express + WebSockets (`/ws`) + SQLite (`./data/quiz.sqlite`).
-
-## Variables d'environnement
-
-Copier `.env.example` vers `.env` pour personnaliser les accès régie :
-
-- `ADMIN_EMAIL` : e-mail de connexion à la régie
-- `ADMIN_NAME` : nom affiché dans l'historique des opérations
-- `ADMIN_PASSCODE` : mot de passe / code d'accès de la régie
-- `SQLITE_PATH` *(optionnel)* : chemin personnalisé du fichier SQLite
+L'application démarre sur `http://localhost:3000`.
 
 ## Déploiement sur Vercel
 
 Le dépôt inclut `vercel.json` et la fonction serverless `api/index.ts` :
 
 1. Importer le dépôt Git sur **Vercel** (Framework Preset : *Vite*, Build Command : `npm run build`, Output Directory : `dist`).
-2. Configurer les variables d'environnement dans **Settings → Environment Variables** (`ADMIN_EMAIL`, `ADMIN_PASSCODE`, `ADMIN_NAME`).
-3. Déployer :
-   - Les routes `/api/*` sont servies par `api/index.ts`.
-   - Les routes publiques et régie (`/`, `/live`, `/inscription`, `/classement`, `/admin/*`) sont routées vers la SPA.
-   - En environnement serverless (sans WebSocket persistant), la synchronisation temps réel bascule automatiquement sur un rafraîchissement HTTP haute fréquence (`/api/state`).
+2. Configurer les variables Supabase (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, et optionnellement `ADMIN_EMAIL`).
+3. Déployer : les inscriptions et mises à jour de scores s'enregistrent dans **Supabase** et se propagent en direct sur l'Écran Live via **Supabase Realtime**.

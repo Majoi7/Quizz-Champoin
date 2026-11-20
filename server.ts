@@ -1,11 +1,12 @@
+import 'dotenv/config';
 import express from 'express';
 import http from 'node:http';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
-import { createApiApp } from './server/app';
-import { getFullQuizState } from './server/db';
-import type { ServerWsMessage } from './src/types/quiz';
+import { createApiApp } from './server/app.ts';
+import { getFullQuizState } from './server/db.ts';
+import type { ServerWsMessage } from './src/types/quiz.ts';
 
 let wss: WebSocketServer | null = null;
 
@@ -27,16 +28,19 @@ const app = createApiApp({ onBroadcast: broadcastWs });
 const server = http.createServer(app);
 wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   try {
-    ws.send(
-      JSON.stringify({
-        type: 'state:sync',
-        payload: getFullQuizState(),
-      } satisfies ServerWsMessage)
-    );
+    const state = await getFullQuizState();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'state:sync',
+          payload: state,
+        } satisfies ServerWsMessage)
+      );
+    }
   } catch {
-    // Ignore transient closed socket during handshake
+    // Ignore transient sync error during handshake
   }
 });
 

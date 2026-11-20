@@ -59,7 +59,7 @@ async function compressAvatarFile(file: File): Promise<string> {
 }
 
 export function RegisterPage() {
-  const { competition } = useQuiz();
+  const { competition, refreshState } = useQuiz();
 
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
@@ -116,6 +116,7 @@ export function RegisterPage() {
         avatar_url: avatarUrl.trim() || undefined,
       });
       setRegistered(res.participant);
+      void refreshState();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Impossible de finaliser l'inscription.");
     } finally {

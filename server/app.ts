@@ -1,37 +1,28 @@
 import express from 'express';
 import {
   applyScoreMutation,
-  authenticateAdmin,
   createParticipant,
   deleteParticipant,
-  getAdminByToken,
   getCompetition,
   getFullQuizState,
   getRankedParticipants,
   getRecentEvents,
-  initDatabase,
   resetCompetitionData,
   resetSingleParticipantScore,
-  revokeAdminSession,
   undoLastScoreOperation,
   updateCompetitionConfig,
   updateParticipantDetails,
-} from './db';
-import type { AdminUser, ServerWsMessage } from '../src/types/quiz';
-
-interface AuthedRequest extends express.Request {
-  admin?: AdminUser;
-  authToken?: string;
-}
+} from './db.ts';
+import { requireAdmin, type AuthRequest } from '../src/middleware/auth.ts';
+import type { ServerWsMessage } from '../src/types/quiz.ts';
 
 export interface CreateApiAppOptions {
   onBroadcast?: (message: ServerWsMessage) => void;
 }
 
 export function createApiApp(options: CreateApiAppOptions = {}): express.Express {
-  initDatabase();
-
   const app = express();
+
   app.use((req, _res, next) => {
     const reqWithFlag = req as express.Request & { _body?: boolean };
     if (req.body !== undefined && !reqWithFlag._body) {
@@ -70,56 +61,63 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     return typeof body === 'object' ? (body as Record<string, unknown>) : {};
   }
 
-  function requireAdmin(
-    req: AuthedRequest,
-    res: express.Response,
-    next: express.NextFunction
-  ): void {
-    const header = req.headers.authorization;
-    const token = header?.startsWith('Bearer ') ? header.slice(7).trim() : undefined;
-    const admin = getAdminByToken(token);
-    if (!admin) {
-      res.status(401).json({ error: 'Authentification administrateur requise.' });
-      return;
-    }
-    req.admin = admin;
-    req.authToken = token;
-    next();
-  }
-
   // Healthcheck
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, serverTime: new Date().toISOString() });
   });
 
-  // Public endpoints
-  app.get('/api/state', (_req, res) => {
-    res.json(getFullQuizState());
-  });
-
-  app.get('/api/participants/:id', (req, res) => {
-    const ranked = getRankedParticipants();
-    const participant = ranked.find((p) => p.id === req.params.id);
-    if (!participant) {
-      res.status(404).json({ error: 'Participant introuvable.' });
-      return;
-    }
-    const events = getRecentEvents(200).filter((e) => e.participant_id === participant.id);
-    const competition = getCompetition();
+  // Public Supabase Realtime config (public anon key only, never service role key)
+  app.get('/api/realtime-config', (_req, res) => {
+    const supabaseUrl = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
+    const supabaseAnonKey = (
+      process.env.VITE_SUPABASE_ANON_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      ''
+    ).trim();
     res.json({
-      participant,
-      leaderScore: ranked[0]?.score ?? 0,
-      totalParticipants: ranked.length,
-      events,
-      competition,
-      serverTime: new Date().toISOString(),
+      supabaseUrl: supabaseUrl || null,
+      supabaseAnonKey: supabaseAnonKey || null,
     });
   });
 
-  app.post('/api/register', (req, res) => {
+  // Public endpoints
+  app.get('/api/state', async (_req, res) => {
+    try {
+      res.json(await getFullQuizState());
+    } catch (error) {
+      console.error('[GET /api/state] error:', error);
+      res.status(500).json({ error: 'Impossible de charger l’état en direct.' });
+    }
+  });
+
+  app.get('/api/participants/:id', async (req, res) => {
+    try {
+      const ranked = await getRankedParticipants();
+      const participant = ranked.find((p) => p.id === req.params.id);
+      if (!participant) {
+        res.status(404).json({ error: 'Participant introuvable.' });
+        return;
+      }
+      const [allEvents, competition] = await Promise.all([getRecentEvents(200), getCompetition()]);
+      const events = allEvents.filter((e) => e.participant_id === participant.id);
+      res.json({
+        participant,
+        leaderScore: ranked[0]?.score ?? 0,
+        totalParticipants: ranked.length,
+        events,
+        competition,
+        serverTime: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error('[GET /api/participants/:id] error:', error);
+      res.status(500).json({ error: 'Impossible de charger la fiche participant.' });
+    }
+  });
+
+  app.post('/api/register', async (req, res) => {
     try {
       const body = parseBodyObject(req.body);
-      const created = createParticipant({
+      const created = await createParticipant({
         first_name: typeof body.first_name === 'string' ? body.first_name : String(body.first_name ?? ''),
         last_name: typeof body.last_name === 'string' ? body.last_name : String(body.last_name ?? ''),
         nickname: typeof body.nickname === 'string' ? body.nickname : null,
@@ -127,10 +125,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         avatar_url: typeof body.avatar_url === 'string' ? body.avatar_url : null,
       });
 
+      const participants = await getRankedParticipants();
       broadcast({
         type: 'participants:updated',
         payload: {
-          participants: getRankedParticipants(),
+          participants,
           serverTime: new Date().toISOString(),
         },
       });
@@ -162,37 +161,35 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà associé à un participant.' });
         return;
       }
+      if (code === 'SUPABASE_SCHEMA_MISSING') {
+        res.status(503).json({
+          error:
+            "Les tables Supabase ne sont pas encore créées. Exécutez supabase/schema.sql dans votre SQL Editor Supabase.",
+        });
+        return;
+      }
+      if (code === 'SUPABASE_RLS_BLOCKED') {
+        res.status(503).json({
+          error:
+            'Droits d’écriture Supabase insuffisants : ajoutez SUPABASE_SERVICE_ROLE_KEY dans vos variables serveur.',
+        });
+        return;
+      }
       console.error('[POST /api/register] unexpected error:', err);
       res.status(500).json({ error: "Erreur lors de l'inscription." });
     }
   });
 
-  // Admin Authentication
-  app.post('/api/admin/login', (req, res) => {
-    const email = String(req.body?.email ?? '');
-    const passcode = String(req.body?.passcode ?? '');
-    const auth = authenticateAdmin(email, passcode);
-    if (!auth) {
-      res.status(401).json({ error: 'Identifiants de régie invalides.' });
-      return;
-    }
-    res.json(auth);
-  });
-
-  app.get('/api/admin/me', requireAdmin, (req: AuthedRequest, res) => {
+  // Admin Authentication (Firebase ID Token)
+  app.get('/api/admin/me', requireAdmin, (req: AuthRequest, res) => {
     res.json({ admin: req.admin });
   });
 
-  app.post('/api/admin/logout', requireAdmin, (req: AuthedRequest, res) => {
-    if (req.authToken) revokeAdminSession(req.authToken);
-    res.json({ ok: true });
-  });
-
   // Admin Participant & Scoring Mutations
-  app.post('/api/admin/participants', requireAdmin, (req: AuthedRequest, res) => {
+  app.post('/api/admin/participants', requireAdmin, async (req: AuthRequest, res) => {
     try {
       const body = parseBodyObject(req.body);
-      const created = createParticipant(
+      const created = await createParticipant(
         {
           first_name: typeof body.first_name === 'string' ? body.first_name : String(body.first_name ?? ''),
           last_name: typeof body.last_name === 'string' ? body.last_name : String(body.last_name ?? ''),
@@ -202,10 +199,11 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         },
         { bypassRegistrationLock: true }
       );
+      const participants = await getRankedParticipants();
       broadcast({
         type: 'participants:updated',
         payload: {
-          participants: getRankedParticipants(),
+          participants,
           serverTime: new Date().toISOString(),
         },
       });
@@ -228,18 +226,33 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(409).json({ error: 'Ce numéro de téléphone est déjà utilisé.' });
         return;
       }
+      if (code === 'SUPABASE_SCHEMA_MISSING') {
+        res.status(503).json({
+          error:
+            "Les tables Supabase ne sont pas encore créées. Exécutez supabase/schema.sql dans votre SQL Editor Supabase.",
+        });
+        return;
+      }
+      if (code === 'SUPABASE_RLS_BLOCKED') {
+        res.status(503).json({
+          error:
+            'Droits d’écriture Supabase insuffisants : ajoutez SUPABASE_SERVICE_ROLE_KEY dans vos variables serveur.',
+        });
+        return;
+      }
       console.error('[POST /api/admin/participants] unexpected error:', err);
       res.status(500).json({ error: 'Impossible de créer le participant.' });
     }
   });
 
-  app.patch('/api/admin/participants/:id', requireAdmin, (req: AuthedRequest, res) => {
+  app.patch('/api/admin/participants/:id', requireAdmin, async (req: AuthRequest, res) => {
     try {
-      const updated = updateParticipantDetails(req.params.id, req.body ?? {});
+      const updated = await updateParticipantDetails(req.params.id, parseBodyObject(req.body));
+      const participants = await getRankedParticipants();
       broadcast({
         type: 'participants:updated',
         payload: {
-          participants: getRankedParticipants(),
+          participants,
           serverTime: new Date().toISOString(),
         },
       });
@@ -258,13 +271,14 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     }
   });
 
-  app.delete('/api/admin/participants/:id', requireAdmin, (req: AuthedRequest, res) => {
+  app.delete('/api/admin/participants/:id', requireAdmin, async (req: AuthRequest, res) => {
     try {
-      deleteParticipant(req.params.id);
+      await deleteParticipant(req.params.id);
+      const participants = await getRankedParticipants();
       broadcast({
         type: 'participants:updated',
         payload: {
-          participants: getRankedParticipants(),
+          participants,
           serverTime: new Date().toISOString(),
         },
       });
@@ -274,12 +288,13 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     }
   });
 
-  app.post('/api/admin/score', requireAdmin, (req: AuthedRequest, res) => {
+  app.post('/api/admin/score', requireAdmin, async (req: AuthRequest, res) => {
     try {
-      const participantId = String(req.body?.participantId ?? '');
-      const delta = Number(req.body?.delta);
-      const reason = req.body?.reason ?? 'CUSTOM';
-      const result = applyScoreMutation(
+      const body = parseBodyObject(req.body);
+      const participantId = String(body.participantId ?? '');
+      const delta = Number(body.delta);
+      const reason = (body.reason as Parameters<typeof applyScoreMutation>[2]) ?? 'CUSTOM';
+      const result = await applyScoreMutation(
         participantId,
         delta,
         reason,
@@ -305,13 +320,18 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
         res.status(400).json({ error: 'La variation de score doit être non nulle.' });
         return;
       }
-      res.status(404).json({ error: 'Participant introuvable.' });
+      if (code === 'NOT_FOUND') {
+        res.status(404).json({ error: 'Participant introuvable.' });
+        return;
+      }
+      console.error('[POST /api/admin/score] error:', err);
+      res.status(500).json({ error: 'Erreur lors de la mise à jour du score.' });
     }
   });
 
-  app.post('/api/admin/participants/:id/reset', requireAdmin, (req: AuthedRequest, res) => {
+  app.post('/api/admin/participants/:id/reset', requireAdmin, async (req: AuthRequest, res) => {
     try {
-      const result = resetSingleParticipantScore(
+      const result = await resetSingleParticipantScore(
         req.params.id,
         req.admin?.name ?? 'Administrateur'
       );
@@ -328,9 +348,9 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     }
   });
 
-  app.post('/api/admin/undo', requireAdmin, (req: AuthedRequest, res) => {
+  app.post('/api/admin/undo', requireAdmin, async (req: AuthRequest, res) => {
     try {
-      const result = undoLastScoreOperation(req.admin?.name ?? 'Administrateur');
+      const result = await undoLastScoreOperation(req.admin?.name ?? 'Administrateur');
       broadcast({
         type: 'score:applied',
         payload: {
@@ -349,35 +369,46 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     }
   });
 
-  app.patch('/api/admin/competition', requireAdmin, (req: AuthedRequest, res) => {
-    const competition = updateCompetitionConfig(req.body ?? {});
-    const participants = getRankedParticipants();
-    broadcast({
-      type: 'competition:updated',
-      payload: {
-        competition,
-        participants,
-        serverTime: new Date().toISOString(),
-      },
-    });
-    res.json({ competition, participants });
+  app.patch('/api/admin/competition', requireAdmin, async (req: AuthRequest, res) => {
+    try {
+      const competition = await updateCompetitionConfig(parseBodyObject(req.body));
+      const participants = await getRankedParticipants();
+      broadcast({
+        type: 'competition:updated',
+        payload: {
+          competition,
+          participants,
+          serverTime: new Date().toISOString(),
+        },
+      });
+      res.json({ competition, participants });
+    } catch (error) {
+      console.error('[PATCH /api/admin/competition] error:', error);
+      res.status(500).json({ error: 'Impossible de mettre à jour la compétition.' });
+    }
   });
 
-  app.post('/api/admin/competition/reset', requireAdmin, (req: AuthedRequest, res) => {
-    const mode = req.body?.mode === 'full' ? 'full' : 'scores';
-    resetCompetitionData(mode);
-    const fullState = getFullQuizState();
-    broadcast({
-      type: 'state:sync',
-      payload: fullState,
-    });
-    res.json(fullState);
+  app.post('/api/admin/competition/reset', requireAdmin, async (req: AuthRequest, res) => {
+    try {
+      const body = parseBodyObject(req.body);
+      const mode = body.mode === 'full' ? 'full' : 'scores';
+      await resetCompetitionData(mode);
+      const fullState = await getFullQuizState();
+      broadcast({
+        type: 'state:sync',
+        payload: fullState,
+      });
+      res.json(fullState);
+    } catch (error) {
+      console.error('[POST /api/admin/competition/reset] error:', error);
+      res.status(500).json({ error: 'Impossible de réinitialiser la compétition.' });
+    }
   });
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const errObj = err as { type?: string; status?: number } | null;
     if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
-      res.status(413).json({ error: "La photo ou les données envoyées sont trop volumineuses." });
+      res.status(413).json({ error: 'La photo ou les données envoyées sont trop volumineuses.' });
       return;
     }
     if (errObj?.type === 'entity.parse.failed' || errObj?.status === 400) {
