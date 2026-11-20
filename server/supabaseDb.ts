@@ -253,6 +253,14 @@ function sanitizeAvatarUrl(raw: string | null | undefined): string | null {
   throw new Error('INVALID_AVATAR');
 }
 
+export function parseAllowedAdminEmails(raw = process.env.ADMIN_EMAIL): string[] {
+  if (!raw || typeof raw !== 'string') return [];
+  return raw
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 export async function upsertSupabaseAdminUser(
   uid: string,
   email: string,
@@ -261,7 +269,11 @@ export async function upsertSupabaseAdminUser(
   const client = getClient();
   const cleanEmail = email.trim().toLowerCase();
   const displayName = (name && name.trim()) || cleanEmail.split('@')[0] || 'Régie';
-  const configuredOwner = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  const allowedEmails = parseAllowedAdminEmails();
+
+  if (allowedEmails.length > 0 && !allowedEmails.includes(cleanEmail)) {
+    throw new Error('FORBIDDEN_ADMIN');
+  }
 
   const { count, error: countErr } = await client
     .from('users')
@@ -272,14 +284,25 @@ export async function upsertSupabaseAdminUser(
       uid,
       email: cleanEmail,
       name: displayName,
-      role: !configuredOwner || cleanEmail === configuredOwner ? 'SUPER_ADMIN' : 'HOST',
+      role: allowedEmails.length === 0 || allowedEmails[0] === cleanEmail ? 'SUPER_ADMIN' : 'HOST',
     };
   }
 
+  if ((count ?? 0) > 0 && allowedEmails.length === 0) {
+    const { data: existingAdmin } = await client
+      .from('users')
+      .select('id, role')
+      .or(`uid.eq.${uid},email.eq.${cleanEmail}`)
+      .limit(1)
+      .maybeSingle();
+
+    if (!existingAdmin) {
+      throw new Error('FORBIDDEN_ADMIN');
+    }
+  }
+
   const assignedRole =
-    (count ?? 0) === 0 || (configuredOwner && cleanEmail === configuredOwner)
-      ? 'SUPER_ADMIN'
-      : 'HOST';
+    (count ?? 0) === 0 || allowedEmails.includes(cleanEmail) ? 'SUPER_ADMIN' : 'HOST';
 
   const { data, error } = await client
     .from('users')
@@ -315,6 +338,36 @@ export async function upsertSupabaseAdminUser(
     name: String(data.name),
     role: data.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : 'HOST',
   };
+}
+
+export async function verifySupabaseAccessToken(
+  token: string
+): Promise<{ uid: string; email: string; name: string; role: 'SUPER_ADMIN' | 'HOST' }> {
+  const cleanToken = token.trim();
+  if (!cleanToken) {
+    throw new Error('INVALID_TOKEN');
+  }
+
+  const client = getClient();
+  const { data, error } = await client.auth.getUser(cleanToken);
+  if (error || !data?.user) {
+    throw new Error('INVALID_TOKEN');
+  }
+
+  const email = (data.user.email || '').trim().toLowerCase();
+  if (!email) {
+    throw new Error('INVALID_TOKEN');
+  }
+
+  const metadata = (data.user.user_metadata ?? {}) as Record<string, unknown>;
+  const rawName =
+    typeof metadata.full_name === 'string'
+      ? metadata.full_name
+      : typeof metadata.name === 'string'
+        ? metadata.name
+        : undefined;
+
+  return upsertSupabaseAdminUser(data.user.id, email, rawName);
 }
 
 export async function getSupabaseCompetition(): Promise<Competition> {

@@ -12,7 +12,13 @@ import {
   undoLastScoreOperation,
   updateCompetitionConfig,
   updateParticipantDetails,
+  upsertAdminUser,
 } from './db.ts';
+import {
+  getConfiguredAdminAccessCode,
+  signAdminSessionToken,
+  verifyConfiguredAccessCode,
+} from './adminToken.ts';
 import { requireAdmin, type AuthRequest } from '../src/middleware/auth.ts';
 import type { ServerWsMessage } from '../src/types/quiz.ts';
 
@@ -107,10 +113,12 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
       ''
     ).trim();
     const wsEnabled = !process.env.VERCEL;
+    const accessCodeEnabled = Boolean(getConfiguredAdminAccessCode());
     res.json({
       supabaseUrl: supabaseUrl || null,
       supabaseAnonKey: supabaseAnonKey || null,
       wsEnabled,
+      accessCodeEnabled,
     });
   });
 
@@ -203,7 +211,61 @@ export function createApiApp(options: CreateApiAppOptions = {}): express.Express
     }
   });
 
-  // Admin Authentication (Firebase ID Token)
+  // Admin Authentication (Firebase ID Token ou Code d'accès Régie)
+  app.post('/api/admin/login', async (req, res) => {
+    try {
+      const configuredCode = getConfiguredAdminAccessCode();
+      if (!configuredCode) {
+        res.status(503).json({
+          error:
+            "Code d'accès régie non configuré. Définissez ADMIN_ACCESS_CODE dans les variables d'environnement Vercel ou connectez-vous avec Google.",
+        });
+        return;
+      }
+
+      const body = parseBodyObject(req.body);
+      const accessCode = typeof body.accessCode === 'string' ? body.accessCode : '';
+      if (!accessCode.trim()) {
+        res.status(400).json({ error: "Veuillez saisir le code d'accès régie." });
+        return;
+      }
+
+      if (!verifyConfiguredAccessCode(accessCode)) {
+        res.status(401).json({ error: "Code d'accès régie incorrect." });
+        return;
+      }
+
+      const rawName = typeof body.name === 'string' ? body.name.replace(/\s+/g, ' ').trim() : '';
+      const rawEmail =
+        typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const fallbackEmail =
+        (process.env.ADMIN_EMAIL || '').trim().toLowerCase() || 'regie@quiz-champion.local';
+      const email = rawEmail || fallbackEmail;
+      const operatorName = rawName || 'Régie Principale';
+      const uid = `regie_${email.replace(/[^a-z0-9]/gi, '_')}`;
+
+      const dbUser = await upsertAdminUser(uid, email, operatorName);
+      const token = signAdminSessionToken({
+        uid: dbUser.uid,
+        email: dbUser.email,
+        name: dbUser.name,
+      });
+
+      res.json({
+        token,
+        admin: {
+          id: dbUser.uid,
+          email: dbUser.email,
+          name: dbUser.name,
+          role: dbUser.role,
+        },
+      });
+    } catch (error) {
+      console.error('[POST /api/admin/login] error:', error);
+      res.status(500).json({ error: 'Impossible de valider la connexion régie.' });
+    }
+  });
+
   app.get('/api/admin/me', requireAdmin, (req: AuthRequest, res) => {
     res.json({ admin: req.admin });
   });

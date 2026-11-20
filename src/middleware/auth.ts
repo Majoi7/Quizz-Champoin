@@ -1,9 +1,7 @@
 import type express from 'express';
-import type { DecodedIdToken } from 'firebase-admin/auth';
 import type { AdminUser } from '../types/quiz.ts';
 
 export interface AuthRequest extends express.Request {
-  user?: DecodedIdToken;
   admin?: AdminUser;
 }
 
@@ -25,21 +23,19 @@ export const requireAdmin = async (
   }
 
   try {
-    const [{ getAdminAuth }, { upsertAdminUser }] = await Promise.all([
-      import('../lib/firebase-admin.ts'),
-      import('../../server/db.ts'),
-    ]);
-
-    const decodedToken = await getAdminAuth().verifyIdToken(token);
-    req.user = decodedToken;
-
-    const email = decodedToken.email ?? `${decodedToken.uid}@firebase.local`;
-    const dbUser = await upsertAdminUser(
-      decodedToken.uid,
-      email,
-      typeof decodedToken.name === 'string' ? decodedToken.name : undefined
+    const { isSupabaseConfigured, verifySupabaseAccessToken } = await import(
+      '../../server/supabaseDb.ts'
     );
 
+    if (!isSupabaseConfigured()) {
+      res.status(503).json({
+        error:
+          'Authentification Supabase non configurée. Ajoutez SUPABASE_URL et SUPABASE_ANON_KEY dans vos variables d’environnement.',
+      });
+      return;
+    }
+
+    const dbUser = await verifySupabaseAccessToken(token);
     req.admin = {
       id: dbUser.uid,
       email: dbUser.email,
@@ -49,7 +45,23 @@ export const requireAdmin = async (
 
     next();
   } catch (error) {
-    console.error('Error verifying Firebase ID token:', error);
-    res.status(401).json({ error: 'Session administrateur invalide ou expirée.' });
+    const code = error instanceof Error ? error.message : 'UNKNOWN';
+    if (code === 'FORBIDDEN_ADMIN') {
+      res.status(403).json({
+        error: 'Accès refusé : ce compte n’est pas autorisé à accéder à la régie.',
+      });
+      return;
+    }
+    if (code === 'SUPABASE_NOT_CONFIGURED') {
+      res.status(503).json({
+        error:
+          'Authentification Supabase non configurée. Ajoutez SUPABASE_URL et SUPABASE_ANON_KEY.',
+      });
+      return;
+    }
+    if (code !== 'INVALID_TOKEN') {
+      console.error('Error verifying Supabase admin token:', error);
+    }
+    res.status(401).json({ error: 'Session administrateur Supabase invalide ou expirée.' });
   }
 };

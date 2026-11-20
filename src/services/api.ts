@@ -1,4 +1,4 @@
-import { auth } from '../lib/firebase.ts';
+import { getSupabaseClient } from '../lib/supabase.ts';
 import type {
   AdminUser,
   Competition,
@@ -16,10 +16,18 @@ export function setInMemoryAuthToken(token: string | null): void {
 }
 
 async function resolveAuthToken(): Promise<string | null> {
-  if (auth.currentUser) {
-    const freshToken = await auth.currentUser.getIdToken();
-    inMemoryIdToken = freshToken;
-    return freshToken;
+  const client = getSupabaseClient();
+  if (client) {
+    try {
+      const { data } = await client.auth.getSession();
+      const sessionToken = data.session?.access_token ?? null;
+      if (sessionToken) {
+        inMemoryIdToken = sessionToken;
+        return sessionToken;
+      }
+    } catch {
+      // fall back to in-memory token
+    }
   }
   return inMemoryIdToken;
 }

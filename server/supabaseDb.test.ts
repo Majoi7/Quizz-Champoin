@@ -8,6 +8,8 @@ import {
   isSupabaseMissingTableError,
   isSupabaseRlsError,
   isSupabaseUniqueViolation,
+  parseAllowedAdminEmails,
+  verifySupabaseAccessToken,
 } from './supabaseDb.ts';
 
 test('getSupabaseConfig detects SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY', () => {
@@ -114,4 +116,13 @@ test('createSupabaseParticipant rejects invalid name and unsafe avatar before hi
       }),
     /INVALID_AVATAR/
   );
+});
+
+test('parseAllowedAdminEmails normalizes comma-separated emails and verifySupabaseAccessToken rejects empty token', async () => {
+  assert.deepEqual(
+    parseAllowedAdminEmails(' Admin@Example.com , second@test.org '),
+    ['admin@example.com', 'second@test.org']
+  );
+  assert.deepEqual(parseAllowedAdminEmails(''), []);
+  await assert.rejects(() => verifySupabaseAccessToken('   '), /INVALID_TOKEN/);
 });

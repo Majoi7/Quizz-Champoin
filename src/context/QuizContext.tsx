@@ -1,8 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 import { audioService } from '../lib/audioService.ts';
-import { auth, googleAuthProvider } from '../lib/firebase.ts';
-import { getOrCreateSupabaseClient, supabaseClient } from '../lib/supabase.ts';
+import {
+  getOrCreateSupabaseClient,
+  getSupabaseClient,
+  supabaseClient,
+} from '../lib/supabase.ts';
 import { quizApi, setInMemoryAuthToken } from '../services/api.ts';
 import type {
   AdminUser,
@@ -31,14 +33,32 @@ interface QuizContextValue {
   lastScoreBurst: ActiveScoreBurst | null;
   admin: AdminUser | null;
   adminAuthChecked: boolean;
+  supabaseReady: boolean;
   soundEnabled: boolean;
   toggleSound: () => void;
-  loginWithGoogle: () => Promise<AdminUser>;
+  loginWithSupabase: (email: string, password: string) => Promise<AdminUser>;
   logoutAdmin: () => Promise<void>;
   refreshState: () => Promise<void>;
 }
 
 const QuizContext = createContext<QuizContextValue | null>(null);
+
+function translateSupabaseAuthError(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes('invalid login credentials')) {
+    return 'Adresse e-mail ou mot de passe incorrect.';
+  }
+  if (lower.includes('email not confirmed')) {
+    return 'Adresse e-mail non confirmée. Confirmez-la dans Supabase Authentication.';
+  }
+  if (lower.includes('too many requests') || lower.includes('rate limit')) {
+    return 'Trop de tentatives. Veuillez patienter quelques instants.';
+  }
+  if (lower.includes('network') || lower.includes('fetch')) {
+    return 'Impossible de joindre Supabase Auth. Vérifiez votre connexion.';
+  }
+  return message || 'Impossible de vous connecter avec Supabase.';
+}
 
 export function QuizProvider({ children }: { children: React.ReactNode }) {
   const [competition, setCompetition] = useState<Competition | null>(null);
@@ -50,6 +70,7 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
   const [lastScoreBurst, setLastScoreBurst] = useState<ActiveScoreBurst | null>(null);
   const [admin, setAdmin] = useState<AdminUser | null>(null);
   const [adminAuthChecked, setAdminAuthChecked] = useState(false);
+  const [supabaseReady, setSupabaseReady] = useState(Boolean(supabaseClient));
   const [soundEnabled, setSoundEnabled] = useState(() => audioService.isEnabled());
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -131,36 +152,62 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     window.addEventListener('pointerdown', handleGestureUnlock, { once: true, passive: true });
     window.addEventListener('keydown', handleGestureUnlock, { once: true, passive: true });
 
-    const unsubscribeAuth = onAuthStateChanged(auth, async (fbUser) => {
-      if (!mountedRef.current) return;
-      if (!fbUser) {
-        setInMemoryAuthToken(null);
-        setAdmin(null);
-        setAdminAuthChecked(true);
-        return;
-      }
-
-      try {
-        const token = await fbUser.getIdToken();
-        setInMemoryAuthToken(token);
-        const res = await quizApi.adminMe();
-        if (mountedRef.current) {
-          setAdmin(res.admin);
-        }
-      } catch {
-        setInMemoryAuthToken(null);
-        if (mountedRef.current) {
-          setAdmin(null);
-        }
-      } finally {
-        if (mountedRef.current) {
-          setAdminAuthChecked(true);
-        }
-      }
-    });
-
-    let activeSupabaseClient = supabaseClient;
+    let activeSupabaseClient = getSupabaseClient();
     let supabaseChannel: ReturnType<NonNullable<typeof supabaseClient>['channel']> | null = null;
+    let authSubscription: { unsubscribe: () => void } | null = null;
+
+    const attachSupabaseAuth = (client: NonNullable<typeof supabaseClient>) => {
+      if (!mountedRef.current || authSubscription) return;
+      setSupabaseReady(true);
+
+      void client.auth
+        .getSession()
+        .then(async ({ data }) => {
+          if (!mountedRef.current) return;
+          const token = data.session?.access_token ?? null;
+          if (!token) {
+            setInMemoryAuthToken(null);
+            setAdmin(null);
+            setAdminAuthChecked(true);
+            return;
+          }
+          try {
+            setInMemoryAuthToken(token);
+            const res = await quizApi.adminMe();
+            if (mountedRef.current) {
+              setAdmin(res.admin);
+            }
+          } catch {
+            setInMemoryAuthToken(null);
+            await client.auth.signOut().catch(() => undefined);
+            if (mountedRef.current) {
+              setAdmin(null);
+            }
+          } finally {
+            if (mountedRef.current) {
+              setAdminAuthChecked(true);
+            }
+          }
+        })
+        .catch(() => {
+          if (mountedRef.current) {
+            setInMemoryAuthToken(null);
+            setAdmin(null);
+            setAdminAuthChecked(true);
+          }
+        });
+
+      const { data } = client.auth.onAuthStateChange((event, session) => {
+        if (!mountedRef.current) return;
+        if (event === 'SIGNED_OUT' || !session?.access_token) {
+          setInMemoryAuthToken(null);
+          setAdmin(null);
+          return;
+        }
+        setInMemoryAuthToken(session.access_token);
+      });
+      authSubscription = data.subscription;
+    };
 
     const startHttpPolling = () => {
       if (pollingTimerRef.current !== null || !mountedRef.current) return;
@@ -214,6 +261,7 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     };
 
     if (activeSupabaseClient) {
+      attachSupabaseAuth(activeSupabaseClient);
       attachSupabaseRealtime(activeSupabaseClient);
     }
 
@@ -305,9 +353,17 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
           } | null
         ) => {
           if (!mountedRef.current) return;
-          if (!supabaseChannel && cfg?.supabaseUrl && cfg?.supabaseAnonKey) {
+          if (!activeSupabaseClient && cfg?.supabaseUrl && cfg?.supabaseAnonKey) {
             const client = getOrCreateSupabaseClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
-            if (client) attachSupabaseRealtime(client);
+            if (client) {
+              activeSupabaseClient = client;
+              attachSupabaseAuth(client);
+              attachSupabaseRealtime(client);
+            }
+          }
+          if (!activeSupabaseClient) {
+            setSupabaseReady(false);
+            setAdminAuthChecked(true);
           }
           if (cfg?.wsEnabled === true) {
             connectWs();
@@ -321,6 +377,10 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
       )
       .catch(() => {
         if (!mountedRef.current) return;
+        if (!activeSupabaseClient) {
+          setSupabaseReady(false);
+          setAdminAuthChecked(true);
+        }
         if (!supabaseChannel) {
           startHttpPolling();
         }
@@ -329,7 +389,7 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       mountedRef.current = false;
-      unsubscribeAuth();
+      authSubscription?.unsubscribe();
       if (supabaseChannel && activeSupabaseClient) {
         void activeSupabaseClient.removeChannel(supabaseChannel);
       }
@@ -350,18 +410,56 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const loginWithGoogle = useCallback(async () => {
-    const credential = await signInWithPopup(auth, googleAuthProvider);
-    const token = await credential.user.getIdToken();
-    setInMemoryAuthToken(token);
-    const res = await quizApi.adminMe();
-    setAdmin(res.admin);
-    return res.admin;
+  const loginWithSupabase = useCallback(async (email: string, password: string) => {
+    const cleanEmail = email.trim();
+    if (!cleanEmail || !password) {
+      throw new Error('Veuillez saisir votre adresse e-mail et votre mot de passe.');
+    }
+
+    let client = getSupabaseClient();
+    if (!client) {
+      const cfgRes = await fetch('/api/realtime-config').catch(() => null);
+      const cfg = cfgRes?.ok
+        ? ((await cfgRes.json()) as {
+            supabaseUrl?: string | null;
+            supabaseAnonKey?: string | null;
+          })
+        : null;
+      client = getOrCreateSupabaseClient(cfg?.supabaseUrl, cfg?.supabaseAnonKey);
+    }
+
+    if (!client) {
+      throw new Error(
+        'Authentification Supabase non configurée. Ajoutez SUPABASE_URL et SUPABASE_ANON_KEY dans vos variables d’environnement.'
+      );
+    }
+    setSupabaseReady(true);
+
+    const { data, error } = await client.auth.signInWithPassword({
+      email: cleanEmail,
+      password,
+    });
+
+    if (error || !data.session?.access_token) {
+      throw new Error(translateSupabaseAuthError(error?.message ?? ''));
+    }
+
+    setInMemoryAuthToken(data.session.access_token);
+    try {
+      const res = await quizApi.adminMe();
+      setAdmin(res.admin);
+      return res.admin;
+    } catch (verifyErr) {
+      setInMemoryAuthToken(null);
+      await client.auth.signOut().catch(() => undefined);
+      setAdmin(null);
+      throw verifyErr;
+    }
   }, []);
 
   const logoutAdmin = useCallback(async () => {
     try {
-      await signOut(auth);
+      await getSupabaseClient()?.auth.signOut();
     } catch {
       // ignore
     }
@@ -381,9 +479,10 @@ export function QuizProvider({ children }: { children: React.ReactNode }) {
         lastScoreBurst,
         admin,
         adminAuthChecked,
+        supabaseReady,
         soundEnabled,
         toggleSound,
-        loginWithGoogle,
+        loginWithSupabase,
         logoutAdmin,
         refreshState,
       }}

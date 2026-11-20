@@ -211,9 +211,38 @@ test('POST /api/register returns clean JSON 400/413 for malformed or oversized J
   assert.ok(tooBigBody.error.length > 0);
 });
 
-test('GET /api/admin/me rejects unauthenticated requests with 401', async () => {
+test('GET /api/admin/me rejects unauthenticated requests with 401 and returns 503 when Bearer token is sent without Supabase', async () => {
   const res = await fetch(`${baseUrl}/api/admin/me`);
   assert.equal(res.status, 401);
+
+  const prevUrl = process.env.SUPABASE_URL;
+  const prevKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const prevAnon = process.env.SUPABASE_ANON_KEY;
+  const prevViteUrl = process.env.VITE_SUPABASE_URL;
+  const prevViteAnon = process.env.VITE_SUPABASE_ANON_KEY;
+  try {
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    delete process.env.SUPABASE_ANON_KEY;
+    delete process.env.VITE_SUPABASE_URL;
+    delete process.env.VITE_SUPABASE_ANON_KEY;
+
+    const noSupabase = await fetch(`${baseUrl}/api/admin/me`, {
+      headers: { Authorization: 'Bearer fake.jwt.token' },
+    });
+    assert.equal(noSupabase.status, 503);
+  } finally {
+    if (prevUrl !== undefined) process.env.SUPABASE_URL = prevUrl;
+    else delete process.env.SUPABASE_URL;
+    if (prevKey !== undefined) process.env.SUPABASE_SERVICE_ROLE_KEY = prevKey;
+    else delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (prevAnon !== undefined) process.env.SUPABASE_ANON_KEY = prevAnon;
+    else delete process.env.SUPABASE_ANON_KEY;
+    if (prevViteUrl !== undefined) process.env.VITE_SUPABASE_URL = prevViteUrl;
+    else delete process.env.VITE_SUPABASE_URL;
+    if (prevViteAnon !== undefined) process.env.VITE_SUPABASE_ANON_KEY = prevViteAnon;
+    else delete process.env.VITE_SUPABASE_ANON_KEY;
+  }
 });
 
 test('api/index serverless handler handles pre-parsed body without 500', async () => {
