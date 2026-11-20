@@ -142,14 +142,6 @@ export function AdminLoginPage() {
                 <LogIn className="h-4 w-4" />
                 <span>{submitting ? 'Connexion en cours...' : 'Se connecter à la régie'}</span>
               </button>
-
-              <p className="text-xs text-[#525866] text-center leading-relaxed pt-1">
-                Créez votre compte administrateur dans{' '}
-                <span className="font-semibold text-[#141414]">
-                  Supabase → Authentication → Users
-                </span>
-                .
-              </p>
             </form>
           </div>
 
